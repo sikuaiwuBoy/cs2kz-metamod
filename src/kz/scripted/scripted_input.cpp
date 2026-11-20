@@ -276,8 +276,7 @@ bool ScriptedInput::Load(const char *filePath)
 			line.pop_back();
 		}
 		// P1: tolerate a UTF-8 BOM written by PowerShell/Excel
-		if (line.size() >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB
-			&& (unsigned char)line[2] == 0xBF)
+		if (line.size() >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
 		{
 			line.erase(0, 3);
 		}
@@ -435,8 +434,8 @@ void ScriptedInput::Reset()
 
 void ScriptedInput::PrintStatus(KZPlayer *player) const
 {
-	META_CONPRINTF("[KZScript] loaded=%d active=%d idx=%zu/%zu mode=%s path=%s\n", this->loaded ? 1 : 0, this->active ? 1 : 0,
-				   this->index, this->ticks.size(), ModeName(g_scriptMode), this->path.c_str());
+	META_CONPRINTF("[KZScript] loaded=%d active=%d idx=%zu/%zu mode=%s path=%s\n", this->loaded ? 1 : 0, this->active ? 1 : 0, this->index,
+				   this->ticks.size(), ModeName(g_scriptMode), this->path.c_str());
 }
 
 bool ScriptedInput::OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
