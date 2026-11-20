@@ -11,6 +11,7 @@
 #include "kz/trigger/kz_trigger.h"
 #include "kz/recording/kz_recording.h"
 #include "kz/replays/kz_replaysystem.h"
+#include "kz/scripted/scripted_input.h"
 #include <algorithm>
 #include "tier0/memdbgon.h"
 
@@ -1034,6 +1035,7 @@ void KZJumpstatsService::EndJump(bool landed)
 		return;
 	}
 	jump->End();
+	scripted::LogJump(this->player, jump);
 	if (jump->GetJumpType() == JumpType_FullInvalid)
 	{
 		return;

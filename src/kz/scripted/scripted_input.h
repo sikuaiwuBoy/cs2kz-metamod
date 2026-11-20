@@ -7,6 +7,7 @@
 #include <vector>
 
 class KZPlayer;
+class Jump;
 
 // Scripted usercmd playback (offline CSV -> server-side override).
 // CSV columns: tick,yaw,pitch,fm,sm,um,buttons
@@ -76,4 +77,8 @@ namespace scripted
 	// Returns true when the command was overwritten (caller must run the original).
 	bool OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd);
 	void ResetAll();
+
+	// Y3 diagnostics: unconditional per-jump and per-usercmd CSV logs.
+	void LogJump(KZPlayer *player, Jump *jump);
+	void LogCommand(KZPlayer *player, CUserCmd *cmd);
 } // namespace scripted

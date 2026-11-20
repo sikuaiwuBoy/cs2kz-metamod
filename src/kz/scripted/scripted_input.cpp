@@ -1,10 +1,12 @@
 #include "scripted_input.h"
 
 #include "kz/kz.h"
+#include "kz/jumpstats/kz_jumpstats.h"
 #include "utils/simplecmds.h"
 #include "utils/utils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -19,6 +21,36 @@ namespace
 	constexpr int GROUND_STOP_TICKS  = 16;
 
 	ScriptedInput inputs[64];
+
+	static std::ofstream g_jumpLog;
+	static std::ofstream g_cmdLog;
+	static bool g_logsInit = false;
+
+	static void InitLogs()
+	{
+		if (g_logsInit)
+		{
+			return;
+		}
+		g_logsInit = true;
+		char path[512];
+		g_SMAPI->PathFormat(path, sizeof(path), "%s/addons/cs2kz/logs/lj_jumps.csv", g_SMAPI->GetBaseDir());
+		g_jumpLog.open(path, std::ios::out | std::ios::app);
+		if (g_jumpLog.is_open())
+		{
+			g_jumpLog << "server_tick,player_slot,jump_type,valid,invalid_reason,official_distance,raw_distance,"
+						 "takeoff_speed,max_speed,landing_speed,strafes,sync,takeoff_x,takeoff_y,takeoff_z,"
+						 "landing_x,landing_y,landing_z,air_ticks,ground_z_takeoff,"
+						 "landing_origin_actual_x,landing_origin_actual_y,landing_origin_actual_z\n";
+		}
+		g_SMAPI->PathFormat(path, sizeof(path), "%s/addons/cs2kz/logs/lj_cmds.csv", g_SMAPI->GetBaseDir());
+		g_cmdLog.open(path, std::ios::out | std::ios::app);
+		if (g_cmdLog.is_open())
+		{
+			g_cmdLog << "tick_count,server_tick,fm,sm,um,buttons,view_yaw,view_pitch,subtick,"
+						"origin_x,origin_y,origin_z,vel_x,vel_y,vel_z,on_ground\n";
+		}
+	}
 
 	inline int SlotOf(KZPlayer *player)
 	{
@@ -66,6 +98,68 @@ namespace scripted
 		{
 			input.Reset();
 		}
+	}
+
+	void LogJump(KZPlayer *player, Jump *jump)
+	{
+		if (!player || !jump)
+		{
+			return;
+		}
+		InitLogs();
+		if (!g_jumpLog.is_open())
+		{
+			return;
+		}
+		Vector vel;
+		player->GetVelocity(&vel);
+		const Vector &t = jump->adjustedTakeoffOrigin;
+		const Vector &l = jump->adjustedLandingOrigin;
+		f32 raw        = 32.0f + (jump->landingOrigin - jump->takeoffOrigin).Length2D();
+		g_jumpLog << jump->serverTick << ',' << (int)player->GetPlayerSlot() << ',' << (int)jump->GetJumpType() << ','
+				  << (jump->IsValid() ? 1 : 0) << ",\"" << jump->invalidateReason << "\","
+				  << jump->GetDistance(true, false) << ',' << raw << ',' << jump->GetTakeoffSpeed() << ','
+				  << jump->GetMaxSpeed() << ',' << vel.Length2D() << ',' << jump->strafes.size() << ',' << jump->GetSync()
+				  << ',' << t.x << ',' << t.y << ',' << t.z << ',' << l.x << ',' << l.y << ',' << l.z << ','
+				  << (int)std::lround(jump->airtime * 64.0f) << ',' << player->takeoffGroundOrigin.z << ',' << l.x << ','
+				  << l.y << ',' << l.z << '\n';
+		g_jumpLog.flush();
+	}
+
+	void LogCommand(KZPlayer *player, CUserCmd *cmd)
+	{
+		if (!player || !cmd)
+		{
+			return;
+		}
+		InitLogs();
+		if (!g_cmdLog.is_open())
+		{
+			return;
+		}
+		auto *base = cmd->mutable_base();
+		std::string subtick;
+		for (int i = 0; i < base->subtick_moves_size(); i++)
+		{
+			const auto &m = base->subtick_moves(i);
+			if (i)
+			{
+				subtick += '|';
+			}
+			char buf[160];
+			V_snprintf(buf, sizeof(buf), "%.4f;%u;%.4f;%.4f;%.4f;%.4f", m.when(), m.button(), m.analog_forward_delta(),
+					   m.analog_left_delta(), m.pitch_delta(), m.yaw_delta());
+			subtick += buf;
+		}
+		Vector origin = player->GetPlayerPawn()->m_vecAbsOrigin();
+		Vector vel;
+		player->GetVelocity(&vel);
+		u32 serverTick = g_pKZUtils->GetServerGlobals()->tickcount;
+		g_cmdLog << player->GetController()->m_nTickBase() << ',' << serverTick << ',' << base->forwardmove() << ','
+				 << base->leftmove() << ',' << base->upmove() << ',' << base->buttons_pb().buttonstate1() << ','
+				 << base->viewangles().y() << ',' << base->viewangles().x() << ',' << subtick << ',' << origin.x << ','
+				 << origin.y << ',' << origin.z << ',' << vel.x << ',' << vel.y << ',' << vel.z << ','
+				 << ((player->GetPlayerPawn()->m_fFlags() & FL_ONGROUND) ? 1 : 0) << '\n';
 	}
 } // namespace scripted
 
@@ -233,6 +327,7 @@ bool ScriptedInput::OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
 	}
 
 	const ScriptTick &t = this->ticks[this->index];
+	LogCommand(player, cmd);
 	cmd->mutable_base()->clear_subtick_moves();
 	cmd->mutable_base()->set_forwardmove(t.fm);
 	cmd->mutable_base()->set_leftmove(t.sm);
