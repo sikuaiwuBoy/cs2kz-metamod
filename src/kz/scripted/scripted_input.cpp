@@ -73,6 +73,72 @@ namespace
 			out.push_back(cell);
 		}
 	}
+
+	// ---- H1: raw usercmd logging for diagnosing real input ----
+	struct CommandLog
+	{
+		bool active {};
+		int slot {-1};
+		std::string tag;
+		std::ofstream file;
+	};
+
+	CommandLog commandLogs[64];
+
+	CommandLog *GetCommandLog(KZPlayer *player)
+	{
+		int slot = SlotOf(player);
+		if (slot < 0 || !commandLogs[slot].active)
+		{
+			return nullptr;
+		}
+		return &commandLogs[slot];
+	}
+
+	void LogFullCommand(KZPlayer *player, CUserCmd *cmd)
+	{
+		CommandLog *log = GetCommandLog(player);
+		if (!log || !log->file.is_open() || !cmd || !player->GetPlayerPawn())
+		{
+			return;
+		}
+		auto *base = cmd->mutable_base();
+		std::string subtick;
+		char buf[220];
+		for (int i = 0; i < base->subtick_moves_size(); i++)
+		{
+			const auto &m = base->subtick_moves(i);
+			if (i)
+			{
+				subtick += '|';
+			}
+			V_snprintf(buf, sizeof(buf), "%.5f;%u;%d;%.4f;%.4f;%.4f;%.4f", m.when(), (unsigned int)m.button(), m.pressed() ? 1 : 0,
+					   m.analog_forward_delta(), m.analog_left_delta(), m.pitch_delta(), m.yaw_delta());
+			subtick += buf;
+		}
+		Vector origin;
+		player->GetOrigin(&origin);
+		Vector vel;
+		player->GetVelocity(&vel);
+		log->file << log->tag << ',' << player->GetController()->m_nTickBase() << ',' << g_pKZUtils->GetServerGlobals()->tickcount << ','
+				  << base->forwardmove() << ',' << base->leftmove() << ',' << base->upmove() << ',' << base->buttons_pb().buttonstate1() << ','
+				  << base->buttons_pb().buttonstate2() << ',' << base->buttons_pb().buttonstate3() << ',' << cmd->buttonstates.m_pButtonStates[0]
+				  << ',' << cmd->buttonstates.m_pButtonStates[1] << ',' << cmd->buttonstates.m_pButtonStates[2] << ',' << base->viewangles().x()
+				  << ',' << base->viewangles().y() << ',' << base->viewangles().z() << ',' << base->subtick_moves_size() << ',' << subtick << ','
+				  << (cmd->IsLate() ? 1 : 0) << ',' << cmd->flags << ',' << origin.x << ',' << origin.y << ',' << origin.z << ',' << vel.x << ','
+				  << vel.y << ',' << vel.z << ',' << ((player->GetPlayerPawn()->m_fFlags() & FL_ONGROUND) ? 1 : 0) << '\n';
+		log->file.flush();
+	}
+
+	// H2/H3: how scripted input is injected into the usercmd.
+	enum class ScriptMode
+	{
+		Fields,   // original: only base fm/sm/um + CSV buttons
+		Buttons,  // H2: derive IN_FORWARD/IN_BACK/IN_MOVELEFT/IN_MOVERIGHT from fm/sm, OR with CSV buttons
+		Subtick,  // H3: Buttons + one subtick move carrying the analog deltas
+	};
+
+	ScriptMode g_scriptMode = ScriptMode::Fields;
 } // namespace
 
 namespace scripted
@@ -85,6 +151,8 @@ namespace scripted
 
 	bool OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
 	{
+		// H1 diagnostics: log every command (script or not) for a tagged slot.
+		LogFullCommand(player, cmd);
 		ScriptedInput *input = GetForPlayer(player);
 		if (!input || !input->IsActive())
 		{
@@ -330,18 +398,44 @@ bool ScriptedInput::OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
 	cmd->mutable_base()->mutable_viewangles()->set_y(t.yaw);
 	cmd->mutable_base()->mutable_viewangles()->set_z(0.0f);
 
-	cmd->mutable_base()->mutable_buttons_pb()->Clear();
-	u32 b1 = t.buttons;
-	u32 b2 = 0;
-	if (t.buttons)
+	// H2: CS2 movement keys may need to be present in the button state, not just as analog fields.
+	u32 buttons = t.buttons;
+	if (g_scriptMode != ScriptMode::Fields)
 	{
-		cmd->mutable_base()->mutable_buttons_pb()->set_buttonstate1(b1);
-		cmd->mutable_base()->mutable_buttons_pb()->set_buttonstate2(b2);
-		cmd->mutable_base()->mutable_buttons_pb()->set_buttonstate3(0);
+		if (t.fm > 0.0f)
+		{
+			buttons |= IN_FORWARD;
+		}
+		else if (t.fm < 0.0f)
+		{
+			buttons |= IN_BACK;
+		}
+		if (t.sm > 0.0f)
+		{
+			buttons |= IN_MOVELEFT;
+		}
+		else if (t.sm < 0.0f)
+		{
+			buttons |= IN_MOVERIGHT;
+		}
 	}
-	cmd->buttonstates.m_pButtonStates[0] = b1;
-	cmd->buttonstates.m_pButtonStates[1] = b2;
+
+	cmd->mutable_base()->mutable_buttons_pb()->Clear();
+	cmd->mutable_base()->mutable_buttons_pb()->set_buttonstate1(buttons);
+	cmd->mutable_base()->mutable_buttons_pb()->set_buttonstate2(0);
+	cmd->mutable_base()->mutable_buttons_pb()->set_buttonstate3(0);
+	cmd->buttonstates.m_pButtonStates[0] = buttons;
+	cmd->buttonstates.m_pButtonStates[1] = 0;
 	cmd->buttonstates.m_pButtonStates[2] = 0;
+
+	// H3: carry the analog input as a subtick move as well.
+	if (g_scriptMode == ScriptMode::Subtick)
+	{
+		auto *move = cmd->mutable_base()->add_subtick_moves();
+		move->set_when(0.0f);
+		move->set_analog_forward_delta(t.fm);
+		move->set_analog_left_delta(t.sm);
+	}
 
 	CCSPlayerPawn *pawn = player->GetPlayerPawn();
 	bool onGround = (pawn->m_fFlags() & FL_ONGROUND) != 0;
@@ -487,4 +581,90 @@ CON_COMMAND_F(kz_script_bot_status, "Print scripted playback status for a player
 	{
 		input->PrintStatus(player);
 	}
+}
+
+// H1: raw usercmd logging for a tagged slot (works with or without a script running).
+CON_COMMAND_F(kz_cmdlog_start, "Log every usercmd for a slot: kz_cmdlog_start <slot> <tag>", FCVAR_NONE)
+{
+	if (args.ArgC() < 3)
+	{
+		META_CONPRINTF("[KZScript] usage: kz_cmdlog_start <slot> <tag>\n");
+		return;
+	}
+	int slot = atoi(args.Arg(1));
+	if (slot < 0 || slot >= 64)
+	{
+		META_CONPRINTF("[KZScript] invalid slot %d\n", slot);
+		return;
+	}
+	CommandLog &log = commandLogs[slot];
+	if (log.file.is_open())
+	{
+		log.file.flush();
+		log.file.close();
+	}
+	char path[512];
+	g_SMAPI->PathFormat(path, sizeof(path), "%s/addons/cs2kz/logs/cmdlog_%d.csv", g_SMAPI->GetBaseDir(), slot);
+	log.file.open(path, std::ios::out | std::ios::trunc);
+	if (!log.file.is_open())
+	{
+		META_CONPRINTF("[KZScript] cannot open %s\n", path);
+		return;
+	}
+	log.file << "tag,tick_count,server_tick,fm,sm,um,btn_pb1,btn_pb2,btn_pb3,bs0,bs1,bs2,view_x,view_y,view_z,subtick_count,subtick,late,flags,"
+				"origin_x,origin_y,origin_z,vel_x,vel_y,vel_z,on_ground\n";
+	log.file.flush();
+	log.active = true;
+	log.slot = slot;
+	log.tag = args.Arg(2);
+	META_CONPRINTF("[KZScript] cmdlog start slot=%d tag=%s path=%s\n", slot, args.Arg(2), path);
+}
+
+CON_COMMAND_F(kz_cmdlog_stop, "Stop usercmd logging for a slot: kz_cmdlog_stop <slot>", FCVAR_NONE)
+{
+	if (args.ArgC() < 2)
+	{
+		META_CONPRINTF("[KZScript] usage: kz_cmdlog_stop <slot>\n");
+		return;
+	}
+	int slot = atoi(args.Arg(1));
+	if (slot < 0 || slot >= 64)
+	{
+		return;
+	}
+	CommandLog &log = commandLogs[slot];
+	log.active = false;
+	if (log.file.is_open())
+	{
+		log.file.flush();
+		log.file.close();
+	}
+	META_CONPRINTF("[KZScript] cmdlog stop slot=%d tag=%s\n", slot, log.tag.c_str());
+}
+
+CON_COMMAND_F(kz_script_mode, "Set scripted input injection mode: fields | buttons | subtick", FCVAR_NONE)
+{
+	if (args.ArgC() < 2)
+	{
+		META_CONPRINTF("[KZScript] mode=%s\n", g_scriptMode == ScriptMode::Fields ? "fields" : (g_scriptMode == ScriptMode::Buttons ? "buttons" : "subtick"));
+		return;
+	}
+	if (!V_stricmp(args.Arg(1), "fields"))
+	{
+		g_scriptMode = ScriptMode::Fields;
+	}
+	else if (!V_stricmp(args.Arg(1), "buttons"))
+	{
+		g_scriptMode = ScriptMode::Buttons;
+	}
+	else if (!V_stricmp(args.Arg(1), "subtick"))
+	{
+		g_scriptMode = ScriptMode::Subtick;
+	}
+	else
+	{
+		META_CONPRINTF("[KZScript] usage: kz_script_mode <fields|buttons|subtick>\n");
+		return;
+	}
+	META_CONPRINTF("[KZScript] mode=%s\n", args.Arg(1));
 }

@@ -634,7 +634,14 @@ void Jump::End()
 		}
 	}
 	this->serverTick = g_pKZUtils->GetServerGlobals()->tickcount;
-	this->airtime = this->player->landingTimeActual - this->player->takeoffTime;
+	// Jumps that never took off (invalid "First jump", teleport-only jumps) have takeoffTime == 0;
+	// subtracting it would produce a meaningless airtime.
+	f32 takeoffTime = this->player->takeoffTime;
+	this->airtime = takeoffTime > 0.0f ? this->player->landingTimeActual - takeoffTime : 0.0f;
+	if (this->airtime < 0.0f)
+	{
+		this->airtime = 0.0f;
+	}
 }
 
 Strafe *Jump::GetCurrentStrafe()
