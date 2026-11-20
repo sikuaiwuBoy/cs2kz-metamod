@@ -10,18 +10,39 @@ class KZPlayer;
 class Jump;
 
 // Scripted usercmd playback (offline CSV -> server-side override).
-// CSV columns: tick,yaw,pitch,fm,sm,um,buttons
+// Plan CSV columns: tick,yaw,pitch,fm,sm,um,buttons
+// Verbatim CSV columns: vtick,fm,sm,um,pb1,pb2,pb3,bs0,bs1,bs2,pitch,yaw,roll,ns,subticks
+//   subticks: when;button;pressed;afd;ald;pd;yd joined by '|'
 // Optional first comment line: "# start x y z yaw"
 namespace scripted
 {
+	struct ScriptSubtick
+	{
+		f32 when {};
+		u32 button {};
+		bool pressed {};
+		f32 afd {};
+		f32 ald {};
+		f32 pd {};
+		f32 yd {};
+	};
+
 	struct ScriptTick
 	{
 		f32 yaw {};
 		f32 pitch {};
+		f32 roll {};
 		f32 fm {};
 		f32 sm {};
 		f32 um {};
 		u32 buttons {};
+		// verbatim extras
+		u32 button2 {};
+		u32 button3 {};
+		u32 bs0 {};
+		u32 bs1 {};
+		u32 bs2 {};
+		std::vector<ScriptSubtick> subticks;
 	};
 
 	class ScriptedInput
