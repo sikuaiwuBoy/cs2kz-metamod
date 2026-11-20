@@ -12,13 +12,13 @@
 #include <fstream>
 #include <sstream>
 
-using scripted::ScriptTick;
 using scripted::ScriptedInput;
+using scripted::ScriptTick;
 
 namespace
 {
 	constexpr int START_DELAY_TICKS = 64;
-	constexpr int GROUND_STOP_TICKS  = 16;
+	constexpr int GROUND_STOP_TICKS = 16;
 
 	ScriptedInput inputs[64];
 
@@ -115,14 +115,12 @@ namespace scripted
 		player->GetVelocity(&vel);
 		const Vector &t = jump->adjustedTakeoffOrigin;
 		const Vector &l = jump->adjustedLandingOrigin;
-		f32 raw        = 32.0f + (jump->landingOrigin - jump->takeoffOrigin).Length2D();
-		g_jumpLog << jump->serverTick << ',' << (int)player->GetPlayerSlot() << ',' << (int)jump->GetJumpType() << ','
-				  << (jump->IsValid() ? 1 : 0) << ",\"" << jump->invalidateReason << "\","
-				  << jump->GetDistance(true, false) << ',' << raw << ',' << jump->GetTakeoffSpeed() << ','
-				  << jump->GetMaxSpeed() << ',' << vel.Length2D() << ',' << jump->strafes.size() << ',' << jump->GetSync()
-				  << ',' << t.x << ',' << t.y << ',' << t.z << ',' << l.x << ',' << l.y << ',' << l.z << ','
-				  << (int)std::lround(jump->airtime * 64.0f) << ',' << player->takeoffGroundOrigin.z << ',' << l.x << ','
-				  << l.y << ',' << l.z << '\n';
+		f32 raw = 32.0f + (jump->landingOrigin - jump->takeoffOrigin).Length2D();
+		g_jumpLog << jump->serverTick << ',' << (int)player->GetPlayerSlot() << ',' << (int)jump->GetJumpType() << ',' << (jump->IsValid() ? 1 : 0)
+				  << ",\"" << jump->invalidateReason << "\"," << jump->GetDistance(true, false) << ',' << raw << ',' << jump->GetTakeoffSpeed() << ','
+				  << jump->GetMaxSpeed() << ',' << vel.Length2D() << ',' << jump->strafes.size() << ',' << jump->GetSync() << ',' << t.x << ',' << t.y
+				  << ',' << t.z << ',' << l.x << ',' << l.y << ',' << l.z << ',' << (int)std::lround(jump->airtime * 64.0f) << ','
+				  << player->takeoffGroundOrigin.z << ',' << l.x << ',' << l.y << ',' << l.z << '\n';
 		g_jumpLog.flush();
 	}
 
@@ -147,18 +145,17 @@ namespace scripted
 				subtick += '|';
 			}
 			char buf[160];
-			V_snprintf(buf, sizeof(buf), "%.4f;%u;%.4f;%.4f;%.4f;%.4f", m.when(), m.button(), m.analog_forward_delta(),
-					   m.analog_left_delta(), m.pitch_delta(), m.yaw_delta());
+			V_snprintf(buf, sizeof(buf), "%.4f;%u;%.4f;%.4f;%.4f;%.4f", m.when(), m.button(), m.analog_forward_delta(), m.analog_left_delta(),
+					   m.pitch_delta(), m.yaw_delta());
 			subtick += buf;
 		}
 		Vector origin = player->GetPlayerPawn()->m_vecAbsOrigin();
 		Vector vel;
 		player->GetVelocity(&vel);
 		u32 serverTick = g_pKZUtils->GetServerGlobals()->tickcount;
-		g_cmdLog << player->GetController()->m_nTickBase() << ',' << serverTick << ',' << base->forwardmove() << ','
-				 << base->leftmove() << ',' << base->upmove() << ',' << base->buttons_pb().buttonstate1() << ','
-				 << base->viewangles().y() << ',' << base->viewangles().x() << ',' << subtick << ',' << origin.x << ','
-				 << origin.y << ',' << origin.z << ',' << vel.x << ',' << vel.y << ',' << vel.z << ','
+		g_cmdLog << player->GetController()->m_nTickBase() << ',' << serverTick << ',' << base->forwardmove() << ',' << base->leftmove() << ','
+				 << base->upmove() << ',' << base->buttons_pb().buttonstate1() << ',' << base->viewangles().y() << ',' << base->viewangles().x()
+				 << ',' << subtick << ',' << origin.x << ',' << origin.y << ',' << origin.z << ',' << vel.x << ',' << vel.y << ',' << vel.z << ','
 				 << ((player->GetPlayerPawn()->m_fFlags() & FL_ONGROUND) ? 1 : 0) << '\n';
 	}
 } // namespace scripted
@@ -176,7 +173,7 @@ bool ScriptedInput::Load(const char *filePath)
 		META_CONPRINTF("[KZScript] cannot open %s\n", filePath);
 		return false;
 	}
-	this->path   = filePath;
+	this->path = filePath;
 	this->hasStart = false;
 	std::string line;
 	std::vector<std::string> cells;
@@ -196,8 +193,8 @@ bool ScriptedInput::Load(const char *filePath)
 			if (std::sscanf(line.c_str(), "# start %f %f %f %f", &x, &y, &z, &yaw) == 4)
 			{
 				this->startOrigin = Vector(x, y, z);
-				this->startYaw    = yaw;
-				this->hasStart    = true;
+				this->startYaw = yaw;
+				this->hasStart = true;
 			}
 			continue;
 		}
@@ -213,11 +210,11 @@ bool ScriptedInput::Load(const char *filePath)
 		try
 		{
 			ScriptTick tick;
-			tick.yaw     = std::stof(cells[1]);
-			tick.pitch   = std::stof(cells[2]);
-			tick.fm      = std::clamp(std::stof(cells[3]), -1.0f, 1.0f);
-			tick.sm      = std::clamp(std::stof(cells[4]), -1.0f, 1.0f);
-			tick.um      = std::clamp(std::stof(cells[5]), -1.0f, 1.0f);
+			tick.yaw = std::stof(cells[1]);
+			tick.pitch = std::stof(cells[2]);
+			tick.fm = std::clamp(std::stof(cells[3]), -1.0f, 1.0f);
+			tick.sm = std::clamp(std::stof(cells[4]), -1.0f, 1.0f);
+			tick.um = std::clamp(std::stof(cells[5]), -1.0f, 1.0f);
 			tick.buttons = static_cast<u32>(std::stoull(cells[6]));
 			this->ticks.push_back(tick);
 		}
@@ -250,27 +247,26 @@ bool ScriptedInput::Start(KZPlayer *player)
 	angles.z = 0;
 	player->Teleport(&origin, &angles, &velocity);
 
-	this->active         = true;
-	this->index          = 0;
-	this->startTick      = player->GetController()->m_nTickBase() + START_DELAY_TICKS;
-	this->lastTick       = 0;
-	this->wasAirborne    = false;
-	this->groundedTicks  = 0;
+	this->active = true;
+	this->index = 0;
+	this->startTick = player->GetController()->m_nTickBase() + START_DELAY_TICKS;
+	this->lastTick = 0;
+	this->wasAirborne = false;
+	this->groundedTicks = 0;
 
 	if (this->log.is_open())
 	{
 		this->log.close();
 	}
 	char logPath[512];
-	g_SMAPI->PathFormat(logPath, sizeof(logPath), "%s/addons/cs2kz/logs/scripted_%d.csv", g_SMAPI->GetBaseDir(),
-						(int)player->GetPlayerSlot());
+	g_SMAPI->PathFormat(logPath, sizeof(logPath), "%s/addons/cs2kz/logs/scripted_%d.csv", g_SMAPI->GetBaseDir(), (int)player->GetPlayerSlot());
 	this->log.open(logPath, std::ios::out | std::ios::trunc);
 	if (this->log.is_open())
 	{
 		this->log << "tick_count,script_idx,origin_x,origin_y,origin_z,vel_x,vel_y,vel_z,on_ground,yaw\n";
 	}
-	META_CONPRINTF("[KZScript] start slot=%d path=%s ticks=%zu start_tick=%u\n", (int)player->GetPlayerSlot(), this->path.c_str(),
-				   this->ticks.size(), this->startTick);
+	META_CONPRINTF("[KZScript] start slot=%d path=%s ticks=%zu start_tick=%u\n", (int)player->GetPlayerSlot(), this->path.c_str(), this->ticks.size(),
+				   this->startTick);
 	return true;
 }
 
@@ -293,16 +289,16 @@ void ScriptedInput::Reset()
 {
 	this->Stop();
 	this->ticks.clear();
-	this->loaded    = false;
-	this->hasStart  = false;
-	this->index     = 0;
+	this->loaded = false;
+	this->hasStart = false;
+	this->index = 0;
 	this->path.clear();
 }
 
 void ScriptedInput::PrintStatus(KZPlayer *player) const
 {
-	META_CONPRINTF("[KZScript] loaded=%d active=%d idx=%zu/%zu path=%s\n", this->loaded ? 1 : 0, this->active ? 1 : 0,
-				   this->index, this->ticks.size(), this->path.c_str());
+	META_CONPRINTF("[KZScript] loaded=%d active=%d idx=%zu/%zu path=%s\n", this->loaded ? 1 : 0, this->active ? 1 : 0, this->index,
+				   this->ticks.size(), this->path.c_str());
 }
 
 bool ScriptedInput::OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
@@ -352,7 +348,7 @@ bool ScriptedInput::OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
 	cmd->buttonstates.m_pButtonStates[2] = 0;
 
 	CCSPlayerPawn *pawn = player->GetPlayerPawn();
-	bool onGround       = (pawn->m_fFlags() & FL_ONGROUND) != 0;
+	bool onGround = (pawn->m_fFlags() & FL_ONGROUND) != 0;
 	if (!onGround)
 	{
 		this->wasAirborne = true;
@@ -367,8 +363,8 @@ bool ScriptedInput::OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
 	player->GetVelocity(&vel);
 	if (this->log.is_open())
 	{
-		this->log << tick << ',' << this->index << ',' << origin.x << ',' << origin.y << ',' << origin.z << ',' << vel.x << ','
-				  << vel.y << ',' << vel.z << ',' << (onGround ? 1 : 0) << ',' << t.yaw << '\n';
+		this->log << tick << ',' << this->index << ',' << origin.x << ',' << origin.y << ',' << origin.z << ',' << vel.x << ',' << vel.y << ','
+				  << vel.z << ',' << (onGround ? 1 : 0) << ',' << t.yaw << '\n';
 	}
 
 	this->index++;

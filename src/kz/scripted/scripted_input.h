@@ -39,18 +39,22 @@ namespace scripted
 		{
 			return this->loaded;
 		}
+
 		bool IsActive() const
 		{
 			return this->active;
 		}
+
 		size_t GetIndex() const
 		{
 			return this->index;
 		}
+
 		size_t GetCount() const
 		{
 			return this->ticks.size();
 		}
+
 		const std::string &GetPath() const
 		{
 			return this->path;
