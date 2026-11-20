@@ -133,9 +133,12 @@ namespace
 	// H2/H3: how scripted input is injected into the usercmd.
 	enum class ScriptMode
 	{
-		Fields,   // original: only base fm/sm/um + CSV buttons
-		Buttons,  // H2: derive IN_FORWARD/IN_BACK/IN_MOVELEFT/IN_MOVERIGHT from fm/sm, OR with CSV buttons
-		Subtick,  // H3: Buttons + one subtick move carrying the analog deltas
+		// original: only base fm/sm/um + CSV buttons
+		Fields,
+		// H2: derive IN_FORWARD/IN_BACK/IN_MOVELEFT/IN_MOVERIGHT from fm/sm, OR with CSV buttons
+		Buttons,
+		// H3: Buttons + one subtick move carrying the analog deltas
+		Subtick,
 	};
 
 	ScriptMode g_scriptMode = ScriptMode::Fields;
@@ -646,7 +649,16 @@ CON_COMMAND_F(kz_script_mode, "Set scripted input injection mode: fields | butto
 {
 	if (args.ArgC() < 2)
 	{
-		META_CONPRINTF("[KZScript] mode=%s\n", g_scriptMode == ScriptMode::Fields ? "fields" : (g_scriptMode == ScriptMode::Buttons ? "buttons" : "subtick"));
+		const char *mode = "subtick";
+		if (g_scriptMode == ScriptMode::Fields)
+		{
+			mode = "fields";
+		}
+		else if (g_scriptMode == ScriptMode::Buttons)
+		{
+			mode = "buttons";
+		}
+		META_CONPRINTF("[KZScript] mode=%s\n", mode);
 		return;
 	}
 	if (!V_stricmp(args.Arg(1), "fields"))
