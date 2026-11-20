@@ -552,9 +552,11 @@ bool ScriptedInput::OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
 	player->GetVelocity(&vel);
 	if (this->log.is_open())
 	{
+		QAngle eyeAngles = pawn->m_angEyeAngles();
+		i32 angleChanges = pawn->m_ServerViewAngleChanges().Count();
 		this->log << tick << ',' << this->index << ',' << origin.x << ',' << origin.y << ',' << origin.z << ',' << vel.x << ',' << vel.y << ','
-				  << vel.z << ',' << (onGround ? 1 : 0) << ',' << t.yaw << ',' << pawn->m_angEyeAngles().y() << ','
-				  << cmd->base().consumed_server_angle_changes() << ',' << pawn->m_ServerViewAngleChanges().Count() << '\n';
+				  << vel.z << ',' << (onGround ? 1 : 0) << ',' << t.yaw << ',' << eyeAngles.y << ',' << cmd->base().consumed_server_angle_changes()
+				  << ',' << angleChanges << '\n';
 		this->log.flush();
 	}
 
