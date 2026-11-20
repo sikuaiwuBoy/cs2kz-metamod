@@ -18,8 +18,10 @@ using scripted::ScriptTick;
 
 namespace
 {
-	constexpr int START_DELAY_TICKS = 64;
+	constexpr int DEFAULT_START_DELAY_TICKS = 64;
 	constexpr int GROUND_STOP_TICKS = 16;
+	// A2: tunable from the server console (kz_script_delay).
+	int g_startDelayTicks = DEFAULT_START_DELAY_TICKS;
 
 	ScriptedInput inputs[64];
 
@@ -386,7 +388,7 @@ bool ScriptedInput::Start(KZPlayer *player)
 
 	this->active = true;
 	this->index = 0;
-	this->startTick = player->GetController()->m_nTickBase() + START_DELAY_TICKS;
+	this->startTick = player->GetController()->m_nTickBase() + g_startDelayTicks;
 	this->lastTick = 0;
 	this->wasAirborne = false;
 	this->groundedTicks = 0;
@@ -741,6 +743,18 @@ CON_COMMAND_F(kz_cmdlog_stop, "Stop usercmd logging for a slot: kz_cmdlog_stop <
 		log.file.close();
 	}
 	META_CONPRINTF("[KZScript] cmdlog stop slot=%d tag=%s\n", slot, log.tag.c_str());
+}
+
+CON_COMMAND_F(kz_script_delay, "Set scripted playback start delay in ticks: kz_script_delay <ticks> (default 64)", FCVAR_NONE)
+{
+	if (args.ArgC() < 2)
+	{
+		META_CONPRINTF("[KZScript] delay=%d ticks\n", g_startDelayTicks);
+		return;
+	}
+	int ticks = atoi(args.Arg(1));
+	g_startDelayTicks = std::clamp(ticks, 0, 512);
+	META_CONPRINTF("[KZScript] delay=%d ticks\n", g_startDelayTicks);
 }
 
 CON_COMMAND_F(kz_script_mode, "Set scripted input injection mode: fields | buttons | subtick | verbatim", FCVAR_NONE)
