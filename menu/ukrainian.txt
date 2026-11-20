@@ -1,0 +1,170 @@
+// CS2KZ Меню (Українська)
+// Україномовне радіо меню доповнення для плагіна CS2KZ.
+"RadioPanel.txt"
+{
+	"Groups"
+	{
+		"menu_simple"
+		{
+			"hotkey"	"0"
+			"title"		"TP Меню (Просте)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"Чекпоінт (CP)"
+					"cmd"		"radio; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"Телепорт (TP)"
+					"cmd"		"radio; say /tp"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"3"
+					"label"		"Пауза/Продовжити"
+					"cmd"		"radio; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"4"
+					"label"		"Рестарт/Респавн"
+					"cmd"		"radio; say /r"
+				}
+			}
+		}
+
+		"menu_advanced"
+		{
+			"hotkey"	"1"
+			"title"		"TP Меню (Розширене)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"Чекпоінт (CP)"
+					"cmd"		"radio1; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"Телепорт (TP)"
+					"cmd"		"radio1; say /tp"
+				}
+
+				"Prev Checkpoint"
+				{
+					"hotkey"	"3"
+					"label"		"Попередній CP"
+					"cmd"		"radio1; say /prevcp"
+				}
+
+				"Next Checkpoint"
+				{
+					"hotkey"	"4"
+					"label"		"Наступний CP"
+					"cmd"		"radio1; say /nextcp"
+				}
+
+				"Undo Teleport"
+				{
+					"hotkey"	"5"
+					"label"		"Відмінити TP"
+					"cmd"		"radio1; say /undo"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"6"
+					"label"		"Пауза/Продовжити"
+					"cmd"		"radio1; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"7"
+					"label"		"Рестарт/Респавн"
+					"cmd"		"radio1; say /r"
+				}
+
+				"Noclip"
+				{
+					"hotkey"	"8"
+					"label"		"Перемикання Noclip"
+					"cmd"		"radio1; say /noclip"
+				}
+			}
+		}
+
+		"menu_option"
+		{
+			"hotkey"	"2"
+			"title"		"Меню Опцій"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Set Custom Start Position"
+				{
+					"hotkey"	"1"
+					"label"		"Встановити стартову позицію"
+					"cmd"		"say /ssp"
+				}
+
+				"Clear Custom Start Position"
+				{
+					"hotkey"	"2"
+					"label"		"Скинути стартову позицію"
+					"cmd"		"say /csp"
+				}
+
+				"Hide"
+				{
+					"hotkey"	"3"
+					"label"		"Показати/Приховати інших гравців"
+					"cmd"		"say /hide"
+				}
+
+				"Hide Weapon"
+				{
+					"hotkey"	"4"
+					"label"		"Показати/Приховати зброю"
+					"cmd"		"say /hideweapon"
+				}
+
+				"Hide Legs"
+				{
+					"hotkey"	"5"
+					"label"		"Показати/Приховати ноги"
+					"cmd"		"say /hidelegs"
+				}
+
+				"Toggle Jumpstats"
+				{
+					"hotkey"	"6"
+					"label"		"Перемкнути статистику стрибків"
+					"cmd"		"say /js"
+				}
+
+				"Toggle Jumpstats Always"
+				{
+					"hotkey"	"7"
+					"label"		"Статистика для всіх стрибків"
+					"cmd"		"say /jsalways"
+				}
+			}
+		}
+	}
+}

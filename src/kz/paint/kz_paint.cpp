@@ -1,0 +1,330 @@
+#include "kz_paint.h"
+#include "kz/option/menu/tables.h"
+#include "kz/hud/kz_hud.h"
+#include "kz/language/kz_language.h"
+#include "kz/option/kz_option.h"
+#include "utils/simplecmds.h"
+#include "utils/utils.h"
+#include "sdk/tracefilter.h"
+#include "sdk/navphysicsinterface.h"
+#include "tier0/globalsymbol.h"
+#include "sdk/recipientfilters.h"
+
+void KZPaintService::Init()
+{
+	KZPaintService::RegisterMenu();
+}
+
+void KZPaintService::Reset()
+{
+	this->autoPaintEnabled = false;
+	this->hasLastAutoPaintPosition = false;
+	this->nextAutoPaintTime = 0.0;
+}
+
+Color KZPaintService::GetColor() const
+{
+	// The menu's color picker also offers gradients, which have no single RGB: fall back to the
+	// default for those, the same way the legacy HUD does.
+	const Color stored = player->optionService->GetPreferenceColor("paintColor", KZ_PAINT_DEFAULT_COLOR);
+	return panorama::ResolveSolidColor(stored, KZ_PAINT_DEFAULT_COLOR);
+}
+
+f32 KZPaintService::GetSize() const
+{
+	return (f32)player->optionService->GetPreferenceFloat("paintSize", DEFAULT_PAINT_SIZE);
+}
+
+bool KZPaintService::SetColor(const char *colorName)
+{
+	if (!colorName)
+	{
+		return false;
+	}
+
+	Color color;
+	if (!utils::ParseColorName(colorName, color))
+	{
+		return false;
+	}
+
+	u32 colorData = ((u32)color.r() << 24) | ((u32)color.g() << 16) | ((u32)color.b() << 8) | (u32)color.a();
+	player->optionService->SetPreferenceInt("paintColor", colorData);
+	return true;
+}
+
+bool KZPaintService::SetColorRGB(u8 r, u8 g, u8 b, u8 a)
+{
+	u32 colorData = ((u32)r << 24) | ((u32)g << 16) | ((u32)b << 8) | (u32)a;
+	player->optionService->SetPreferenceInt("paintColor", colorData);
+	return true;
+}
+
+bool KZPaintService::SetSize(f32 value)
+{
+	if (value <= 0.0f)
+	{
+		return false;
+	}
+
+	player->optionService->SetPreferenceFloat("paintSize", MIN(value, MAX_PAINT_SIZE));
+	return true;
+}
+
+const char *KZPaintService::GetColorName() const
+{
+	Color color = GetColor();
+
+	if (color.r() == 255 && color.g() == 0 && color.b() == 0)
+	{
+		return "Red";
+	}
+	if (color.r() == 255 && color.g() == 255 && color.b() == 255)
+	{
+		return "White";
+	}
+	if (color.r() == 0 && color.g() == 0 && color.b() == 0)
+	{
+		return "Black";
+	}
+	if (color.r() == 0 && color.g() == 0 && color.b() == 255)
+	{
+		return "Blue";
+	}
+	if (color.r() == 165 && color.g() == 42 && color.b() == 42)
+	{
+		return "Brown";
+	}
+	if (color.r() == 0 && color.g() == 128 && color.b() == 0)
+	{
+		return "Green";
+	}
+	if (color.r() == 255 && color.g() == 255 && color.b() == 0)
+	{
+		return "Yellow";
+	}
+	if (color.r() == 128 && color.g() == 0 && color.b() == 128)
+	{
+		return "Purple";
+	}
+
+	return "Custom";
+}
+
+bool KZPaintService::ShouldShowAllPaint() const
+{
+	return this->player->optionService->GetPreferenceBool("showAllPaint", false);
+}
+
+bool KZPaintService::IsAutoPaintEnabled() const
+{
+	return this->autoPaintEnabled;
+}
+
+void KZPaintService::OnGameFrame()
+{
+	for (KZPlayer *player : g_pKZPlayerManager->GetAllSlots())
+	{
+		if (!player->paintService)
+		{
+			continue;
+		}
+
+		player->paintService->TryAutoPaint();
+	}
+}
+
+void KZPaintService::ToggleAutoPaint()
+{
+	this->autoPaintEnabled = !this->autoPaintEnabled;
+	if (this->autoPaintEnabled)
+	{
+		this->hasLastAutoPaintPosition = false;
+		this->nextAutoPaintTime = 0.0;
+	}
+}
+
+void KZPaintService::ToggleShowAllPaint()
+{
+	bool newValue = !this->player->optionService->GetPreferenceBool("showAllPaint", false);
+	this->player->optionService->SetPreferenceBool("showAllPaint", newValue);
+}
+
+// Commands
+
+#define KZ_PAINT_TRACE_DISTANCE 32768.0f
+
+bool KZPaintService::TracePaint(trace_t &tr) const
+{
+	CCSPlayerPawnBase *pawn = static_cast<CCSPlayerPawnBase *>(this->player->GetCurrentPawn());
+	if (!pawn)
+	{
+		return false;
+	}
+
+	Vector origin;
+	this->player->GetEyeOrigin(&origin);
+	QAngle angles = pawn->v_angle();
+
+	Vector forward;
+	AngleVectors(angles, &forward);
+	Vector endPos = origin + forward * KZ_PAINT_TRACE_DISTANCE;
+
+	CTraceFilterPlayerMovementCS filter(pawn);
+	filter.EnableInteractsExcludeLayer(LAYER_INDEX_CONTENTS_PLAYER_CLIP);
+	filter.EnableInteractsExcludeLayer(LAYER_INDEX_CONTENTS_PLAYER);
+	INavPhysicsInterface::TraceLine(origin, endPos, &filter, &tr);
+
+	return tr.DidHit();
+}
+
+void KZPaintService::PlacePaint()
+{
+	trace_t tr;
+	if (!this->TracePaint(tr))
+	{
+		return;
+	}
+
+	CGlobalSymbol paintDecal = MakeGlobalSymbol("paint");
+	this->pendingPaint = true;
+	g_pKZUtils->DecalTrace(&tr, &paintDecal, 0.0f);
+	this->pendingPaint = false;
+}
+
+void KZPaintService::TryAutoPaint()
+{
+	if (!this->autoPaintEnabled)
+	{
+		return;
+	}
+
+	f64 curTime = g_pKZUtils->GetGlobals()->curtime;
+	if (curTime < this->nextAutoPaintTime)
+	{
+		return;
+	}
+	this->nextAutoPaintTime = curTime + 0.05;
+
+	trace_t tr;
+	if (!this->TracePaint(tr))
+	{
+		return;
+	}
+
+	if (this->hasLastAutoPaintPosition && (tr.m_vEndPos - this->lastAutoPaintPosition).LengthSqr() < 1.0f)
+	{
+		return;
+	}
+
+	CGlobalSymbol paintDecal = MakeGlobalSymbol("paint");
+	this->pendingPaint = true;
+	g_pKZUtils->DecalTrace(&tr, &paintDecal, 0.0f);
+	this->pendingPaint = false;
+
+	this->lastAutoPaintPosition = tr.m_vEndPos;
+	this->hasLastAutoPaintPosition = true;
+}
+
+SCMD(kz_paint, SCFL_MISC)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->paintService->PlacePaint();
+	return true;
+}
+
+SCMD(kz_paintcolor, SCFL_PREFERENCE | SCFL_MISC)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+
+	if (args->ArgC() < 2)
+	{
+		player->languageService->PrintChat(true, false, "Paint Color Command Usage");
+		player->languageService->PrintChat(true, false, "Current Paint Color", player->paintService->GetColorName(),
+										   player->paintService->GetColor().r(), player->paintService->GetColor().g(),
+										   player->paintService->GetColor().b());
+		return true;
+	}
+
+	// Check for predefined colors
+	if (player->paintService->SetColor(args->Arg(1)))
+	{
+		player->languageService->PrintChat(true, false, "Paint Color Set", player->paintService->GetColorName());
+		return true;
+	}
+
+	// Try to parse as RGB values
+	Color c;
+	if (utils::ParseColorArgs(args, 1, c))
+	{
+		player->paintService->SetColorRGB(c.r(), c.g(), c.b(), c.a());
+		player->languageService->PrintChat(true, false, "Paint Color RGB Set", c.r(), c.g(), c.b(), c.a());
+		return true;
+	}
+
+	player->languageService->PrintChat(true, false, "Paint Color Command Usage");
+	return true;
+}
+
+SCMD(kz_paintsize, SCFL_PREFERENCE | SCFL_MISC)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+
+	if (args->ArgC() < 2 || !utils::IsNumeric(args->Arg(1)))
+	{
+		player->languageService->PrintChat(true, false, "Paint Size Command Usage");
+		player->languageService->PrintChat(true, false, "Current Paint Size", player->paintService->GetSize());
+		return true;
+	}
+
+	f32 value = (f32)atof(args->Arg(1));
+	if (player->paintService->SetSize(value))
+	{
+		player->languageService->PrintChat(true, false, "Paint Size Set", player->paintService->GetSize());
+		return true;
+	}
+
+	player->languageService->PrintChat(true, false, "Paint Size Command Usage");
+	return true;
+}
+
+SCMD(kz_togglepaint, SCFL_MISC | SCFL_PREFERENCE)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->paintService->ToggleAutoPaint();
+
+	player->languageService->PrintChat(true, false, player->paintService->IsAutoPaintEnabled() ? "Paint Toggle Enabled" : "Paint Toggle Disabled");
+	return true;
+}
+
+SCMD(kz_showpaint, SCFL_MISC | SCFL_PREFERENCE)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->paintService->ToggleShowAllPaint();
+
+	player->languageService->PrintChat(true, false, player->paintService->ShouldShowAllPaint() ? "Show Paint Enabled" : "Show Paint Disabled");
+	return true;
+}
+
+SCMD(kz_cleardecals, SCFL_MISC)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	CReliableSingleUserRecipientFilter filter(player->GetPlayerSlot());
+	IGameEvent *event = interfaces::pGameEventManager->CreateEvent("round_start");
+	if (!event)
+	{
+		return true;
+	}
+	event->SetInt("timelimit", 0);
+	event->SetInt("fraglimit", 0);
+	event->SetString("objective", "");
+	IGameEventListener2 *listener = g_pKZUtils->GetLegacyGameEventListener(player->GetPlayerSlot());
+	if (!listener)
+	{
+		interfaces::pGameEventManager->FreeEvent(event);
+		return true;
+	}
+	listener->FireGameEvent(event);
+	interfaces::pGameEventManager->FreeEvent(event);
+	return true;
+}

@@ -1,0 +1,57 @@
+"Phrases"
+{
+	"Pistol Command Usage"
+	{
+		"en"		"{grey}Usage: {default}kz_pistol <name|off>{grey}."
+		"chi"		"{grey}用法: {default}kz_pistol <name|off>{grey}."
+		"zho"		"{grey}用法：{default}kz_pistol <name|off>{grey}."
+		"pl"		"{grey}Użycie: {default}kz_pistol <name|off>{grey}."
+		"ru"		"{grey}Применение: {default}kz_pistol <название|off>{grey}."
+		"ua"		"{grey}Використання: {default}kz_pistol <name|off>{grey}."
+		"sv"		"{grey}Användning: {default}kz_pistol <name|off>{grey}."
+		"de"		"{grey}Anwendung: {default}kz_pistol <name|off>{grey}."
+		"es"		"{grey}Uso: {default}kz_pistol <nombre|off>{grey}."
+		"ko"		"{grey}사용법: {default}kz_pistol <이름|off>{grey}."
+	}
+	"Pistol Disabled"
+	{
+		"en"		"{grey}You have disabled your pistol."
+		"chi"		"{grey}你已禁用手枪."
+		"zho"		"{grey}你已停用手槍。"
+		"pl"		"{grey}Wyłączyłeś swój pistolet."
+		"ru"		"{grey}Вы выключили пистолет."
+		"ua"		"{grey}Ви вимкнули пістолет."
+		"sv"		"{grey}Du har döljt pistolen."
+		"de"		"{grey}Du hast deine Pistole deaktiviert."
+		"es"		"{grey}Has desactivado tu pistola."
+		"ko"		"{grey}권총을 비활성화했습니다."
+	}
+	"Pistol Changed"
+	{
+		"#format"	"pistol:s"
+		"en"		"{grey}You have changed your pistol to {default}{pistol}{grey}."
+		"chi"		"{grey}你已将手枪更换为 {default}{pistol}{grey}."
+		"zho"		"{grey}你已將手槍更換為 {default}{pistol}{grey}。"
+		"pl" 		"{grey}Zmieniłeś swój pistolet na {default}{pistol}{grey}."
+		"ru"		"{grey}Вы изменили свой пистолет на {default}{pistol}{grey}."
+		"ua"		"{grey}Ви змінили пістолет на {default}{pistol}{grey}."
+		"sv"		"{grey}Du har ändrat din pistol till {default}{pistol}{grey}."
+		"de"		"{grey}Du hast deine Pistole zu {default}{pistol}{grey} gewechselt."
+		"es"		"{grey}Has cambiado tu pistola a {default}{pistol}{grey}."
+		"ko"		"{grey}권총을 {default}{pistol}{grey}(으)로 변경했습니다."
+	}
+	"Pistol Unknown"
+	{
+		"#format"	"pistol:s"
+		"en"		"{darkred}Unknown pistol: {default}{pistol}{grey}."
+		"chi"		"{darkred}未知手枪: {default}{pistol}{grey}."
+		"zho"		"{darkred}未知的手槍：{default}{pistol}{grey}。"
+		"pl" 		"{darkred}Nieznany pistolet: {default}{pistol}{grey}."
+		"ru"		"{darkred}Неизвестный пистолет: {default}{pistol}{grey}."
+		"ua"		"{darkred}Невідомий пістолет: {default}{pistol}{grey}."
+		"sv"		"{darkred}Okänd pistol: {default}{pistol}{grey}."
+		"de"		"{darkred}Unbekannte Pistole: {default}{pistol}{grey}."
+		"es"		"{darkred}Pistola no reconocida: {default}{pistol}{grey}."
+		"ko"		"{darkred}알 수 없는 권총: {default}{pistol}{grey}."
+	}
+}

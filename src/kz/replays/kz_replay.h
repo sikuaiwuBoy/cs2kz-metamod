@@ -1,0 +1,348 @@
+#pragma once
+
+#include "common.h"
+#include "sdk/entity/cbaseplayerweapon.h"
+#include "kz_replay.pb.h" // Protobuf definitions for replay header
+// relative to csgo/
+#define KZ_REPLAY_PATH           "kzreplays"
+#define KZ_REPLAY_DOWNLOADS_PATH KZ_REPLAY_PATH "/downloads"
+
+#define KZ_REPLAY_MAX_TIMESCALE 10.0f
+
+class CSubtickMoveStep;
+class KZPlayer;
+
+enum : u32
+{
+	KZ_REPLAY_VERSION = 7,
+};
+
+// Maximum subtick moves per tick. The theoretical engine maximum is 64, but 36 is a much more reasonable amount.
+static constexpr u32 MAX_SUBTICK_MOVES = 36;
+
+enum ReplayType : u32
+{
+	RP_MANUAL = 0,  // Contain who saved the replay.
+	RP_CHEATER = 1, // Contain a reason and a reporter.
+	RP_RUN = 2,
+	RP_JUMPSTATS = 3 // Contain all jumpstats events that happen throughout the replay. Does not contain timer events.
+};
+
+enum RpEventType
+{
+	RPEVENT_UNKNOWN = -1, // Placeholder preserves event indices for future event types.
+	RPEVENT_TIMER_EVENT,
+	RPEVENT_MODE_CHANGE,
+	RPEVENT_STYLE_CHANGE,
+	RPEVENT_TELEPORT,
+	RPEVENT_CHECKPOINT,
+	RPEVENT_CONTROL,
+	RPEVENT_COUNT,
+};
+
+enum RpEventPhase
+{
+	RPEVENT_PHASE_UNKNOWN = -1,
+	RPEVENT_BEFORE_PHYSICS,
+	RPEVENT_DURING_PHYSICS,
+	RPEVENT_AFTER_PHYSICS,
+};
+
+enum RpTeleportReason
+{
+	RPTELEPORT_UNKNOWN = -1,
+	RPTELEPORT_CHECKPOINT,
+	RPTELEPORT_CHECKPOINT_UNDO,
+	RPTELEPORT_MAP_TRIGGER,
+	RPTELEPORT_BHOP_FAIL,
+};
+
+struct RpFlags
+{
+	bool ducking: 1;
+	bool ducked: 1;
+	bool desiresDuck: 1;
+};
+
+struct RpModeStyleInfo
+{
+	char name[64];
+	char shortName[64];
+	char md5[33];
+};
+
+struct RpStyleChangeInfo : public RpModeStyleInfo
+{
+	bool clearStyles;
+};
+
+class Jump;
+
+// This struct is really big, so we don't store them in run replays.
+struct RpJumpStats
+{
+	struct GeneralData
+	{
+		u32 serverTick;
+		f32 takeoffOrigin[3];
+		f32 adjustedTakeoffOrigin[3];
+		f32 takeoffVelocity[3];
+		f32 landingOrigin[3];
+		f32 adjustedLandingOrigin[3];
+
+		u8 jumpType;
+		u8 distanceTier;
+		f32 totalDistance;
+		f32 maxSpeed;
+		f32 maxHeight;
+		f32 airtime;
+		f32 duckDuration;
+		f32 duckEndDuration;
+		f32 release;
+		f32 block;
+		f32 edge;
+		f32 landingEdge;
+		char invalidateReason[256];
+	} overall;
+
+	struct StrafeData
+	{
+		f32 duration;
+		f32 badAngles;
+		f32 overlap;
+		f32 deadAir;
+		f32 syncDuration;
+		f32 width;
+		f32 airGain;
+		f32 maxGain;
+		f32 airLoss;
+		f32 collisionGain;
+		f32 collisionLoss;
+		f32 externalGain;
+		f32 externalLoss;
+		f32 strafeMaxSpeed;
+		bool hasArStats;
+		f32 arMax;
+		f32 arMedian;
+		f32 arAverage;
+	};
+
+	std::vector<StrafeData> strafes;
+
+	struct AAData
+	{
+		u32 strafeIndex;
+		f32 externalSpeedDiff;
+		f32 prevYaw;
+		f32 currentYaw;
+		f32 startFraction;
+		f32 endFraction;
+		f32 wishDir[3];
+		f32 wishSpeed;
+		f32 accel;
+		f32 surfaceFriction;
+		f32 duration;
+		u32 buttons[3];
+		f32 velocityPre[3];
+		f32 velocityPost[3];
+		bool ducking;
+	};
+
+	std::vector<AAData> aaCalls;
+
+	static void FromJump(RpJumpStats &out, Jump *jump);
+	static void ToJump(Jump &out, RpJumpStats *js);
+	void PrintJump(KZPlayer *bot);
+};
+
+struct RpEvent
+{
+	RpEventType type;
+	u32 serverTick;
+	// Events retain their insertion order, including several CP/TP commands in one tick.
+	RpEventPhase phase;
+
+	union RpEventData
+	{
+		struct TimerEvent
+		{
+			enum TimerEventType
+			{
+				TIMER_START,
+				TIMER_END,
+				TIMER_STOP,
+				TIMER_PAUSE,
+				TIMER_RESUME,
+				TIMER_SPLIT,
+				TIMER_CPZ,
+				TIMER_STAGE,
+			} type;
+
+			i32 index; // Course ID for start/end, split number for split, checkpoint number for cpz, stage number for stage.
+			f32 time;  // Final time for end, time reached split/checkpoint/stage for split/cpz/stage. Current time for pause/stop/resume.
+			f32 origin[3];
+		} timer;
+
+		RpModeStyleInfo modeChange;
+
+		RpStyleChangeInfo styleChange;
+
+		struct CheckpointEvent
+		{
+			enum CheckpointEventType
+			{
+				CHECKPOINT_SAVE = 0,
+				CHECKPOINT_RESET,
+			} type;
+
+			i32 index; // One-based saved checkpoint index; zero for reset.
+			f32 origin[3];
+		} checkpoint;
+
+		// The player stops or starts controlling the pawn. In between, the pawn runs on its own without input.
+		struct ControlEvent
+		{
+			enum ControlEventType
+			{
+				CONTROL_AWAY = 0, // The player's client disconnected.
+				CONTROL_SPECTATE, // The player went to spectate.
+				CONTROL_RETURN,   // The player controls the pawn again.
+			} type;
+
+			f32 origin[3];
+		} control;
+
+		struct
+		{
+			RpTeleportReason reason;
+			i32 checkpointIndex; // One-based saved checkpoint, or zero when not applicable.
+			bool hasOrigin;
+			bool hasAngles;
+			bool hasVelocity;
+			f32 previousOrigin[3];
+			f32 origin[3];
+			f32 angles[3];
+			f32 velocity[3];
+		} teleport;
+	} data;
+};
+
+static_assert(std::is_trivial<RpEvent>::value, "RpEvent must be a trivial type");
+
+struct SubtickData
+{
+	u32 numSubtickMoves;
+
+	struct RpSubtickMove
+	{
+		f32 when;
+		// u32 instead of u64 because buttons above 32 bits look irrelevant.
+		u32 button;
+
+		union
+		{
+			bool pressed;
+
+			// The angle deltas are stored for every step, but only v7+ records them for steps without a button.
+			struct
+			{
+				f32 analog_forward_delta;
+				f32 analog_left_delta;
+				f32 pitch_delta;
+				f32 yaw_delta;
+			} analogMove;
+		};
+
+		bool IsAnalogInput()
+		{
+			return button == 0;
+		}
+
+		void FromMove(const CSubtickMoveStep &step);
+	} subtickMoves[MAX_SUBTICK_MOVES];
+};
+
+static_assert(std::is_trivial<SubtickData>::value, "SubtickData must be a trivial type");
+
+struct TickData
+{
+	u32 serverTick {};
+	f32 gameTime {};
+	f32 realTime {};
+	u64 unixTime {};
+	/* Note:
+		Pre data is obtained at the start of physics simulation, post data is obtained at the end.
+		Current input represents a simple version of CUserCmd, and is obtained on SetupMove/CreateMove pre hook.
+	*/
+	// This can change multiple times in a tick.
+	// For the sake of playback we just store and use the very last input (which should have a non zero frametime).
+	u32 cmdNumber {};
+	u32 clientTick {};
+	f32 forward {};
+	f32 left {};
+	f32 up {};
+	bool leftHanded {};
+	i32 weapon; // -1 if no weapon
+
+	struct
+	{
+		i32 index;
+		i32 checkpointCount;
+		i32 teleportCount;
+	} checkpoint {};
+
+	struct MovementData
+	{
+		Vector origin = vec3_origin;
+		Vector velocity = vec3_origin;
+		QAngle angles = vec3_angle;
+		u32 buttons[3] {};
+		f32 jumpPressedTime {};
+		// Quack
+		f32 duckSpeed {};
+		f32 duckAmount {};
+		f32 duckOffset {};
+		f32 lastDuckTime {};
+		RpFlags replayFlags {};
+		u32 entityFlags {};
+		MoveType_t moveType = MOVETYPE_WALK;
+	} pre, post;
+
+	struct ModernJumpPre
+	{
+		i32 lastActualJumpPressTick {};
+		f32 lastActualJumpPressFrac {};
+		i32 lastUsableJumpPressTick {};
+		f32 lastUsableJumpPressFrac {};
+		i32 lastLandedTick {};
+		f32 lastLandedFrac {};
+		Vector lastLandedVelocity {};
+	} modernJump {};
+};
+
+// While tick data is only recorded during certain conditions, metadata is recorded every time the server receives a move message from the client.
+struct CmdData
+{
+	u32 serverTick {};
+	f32 gameTime {};
+	f32 realTime {};
+	u64 unixTime {};
+	f32 framerate {};
+	f32 latency {};
+	f32 avgLoss {};
+	u32 cmdNumber {};
+	u32 clientTick {};
+	f32 forward {};
+	f32 left {};
+	f32 up {};
+	u64 buttons[3] {};
+	QAngle angles {};
+	i32 mousedx {};
+	i32 mousedy {};
+	f32 sensitivity {};
+	f32 m_yaw {};
+	f32 m_pitch {};
+};
+
+// Unified protobuf header type
+using ReplayHeader = cs2kz::replay::ReplayHeader;

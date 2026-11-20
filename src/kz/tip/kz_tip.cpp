@@ -1,0 +1,132 @@
+#include "kz_tip.h"
+#include "kz/anticheat/kz_anticheat.h"
+#include "kz/timer/kz_timer.h"
+#include "kz/language/kz_language.h"
+#include "kz/global/kz_global.h"
+
+#include <vendor/MultiAddonManager/public/imultiaddonmanager.h>
+
+static_global KeyValues *pTipKeyValues;
+static_global std::vector<const char *> tipNames;
+static_global f64 tipInterval;
+static_global i32 nextTipIndex;
+static_global CTimer<> *tipTimer;
+
+extern IMultiAddonManager *g_pMultiAddonManager;
+
+void KZTipService::Init()
+{
+	LoadTips();
+	ShuffleTips();
+	tipTimer = StartTimer(PrintTips, true);
+}
+
+void KZTipService::Reset()
+{
+	this->teamJoinedAtLeastOnce = false;
+}
+
+void KZTipService::ToggleTips()
+{
+	bool showTips = !this->player->optionService->GetPreferenceBool("showTips", true);
+	this->player->optionService->SetPreferenceBool("showTips", showTips);
+	player->languageService->PrintChat(true, false, showTips ? "Option - Tips - Enable" : "Option - Tips - Disable");
+}
+
+bool KZTipService::ShouldPrintTip()
+{
+	return this->player->optionService->GetPreferenceBool("showTips", true);
+}
+
+void KZTipService::PrintTip()
+{
+	this->player->languageService->PrintChat(true, false, tipNames[nextTipIndex]);
+}
+
+void KZTipService::LoadTips()
+{
+	pTipKeyValues = new KeyValues("Tips");
+	pTipKeyValues->UsesEscapeSequences(true);
+
+	char buffer[1024];
+	g_SMAPI->PathFormat(buffer, sizeof(buffer), "addons/cs2kz/translations/*.*");
+	FileFindHandle_t findHandle = {};
+	const char *fileName = g_pFullFileSystem->FindFirst(buffer, &findHandle);
+	if (fileName)
+	{
+		do
+		{
+			char fullPath[1024];
+			g_SMAPI->PathFormat(fullPath, sizeof(fullPath), "%s/addons/cs2kz/translations/%s", g_SMAPI->GetBaseDir(), fileName);
+			if (V_strstr(fileName, "cs2kz-tips-"))
+			{
+				if (!pTipKeyValues->LoadFromFile(g_pFullFileSystem, fullPath, nullptr))
+				{
+					KZ_LOG_WARN(LogChannel::Tip, "Failed to load %s\n", fileName);
+				}
+			}
+			fileName = g_pFullFileSystem->FindNext(findHandle);
+		} while (fileName);
+		g_pFullFileSystem->FindClose(findHandle);
+	}
+
+	FOR_EACH_SUBKEY(pTipKeyValues, it)
+	{
+		tipNames.push_back(it->GetName());
+	}
+
+	tipInterval = KZOptionService::GetOptionFloat("tipInterval", KZ_DEFAULT_TIP_INTERVAL);
+	delete pTipKeyValues;
+}
+
+void KZTipService::ShuffleTips()
+{
+	for (size_t i = tipNames.size(); i > 1; i--)
+	{
+		int j = RandomInt(0, i - 1);
+		V_swap(tipNames[i - 1], tipNames[j]);
+	}
+}
+
+SCMD(kz_tips, SCFL_MISC)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->tipService->ToggleTips();
+	return true;
+}
+
+f64 KZTipService::PrintTips()
+{
+	// No tip translation files loaded, nothing to print.
+	if (tipNames.empty())
+	{
+		return tipInterval;
+	}
+	for (KZPlayer *player : g_pKZPlayerManager->GetInGamePlayers())
+	{
+		if (player->tipService->ShouldPrintTip())
+		{
+			player->tipService->PrintTip();
+		}
+	}
+	nextTipIndex = (nextTipIndex + 1) % tipNames.size();
+	return tipInterval;
+}
+
+void KZTipService::OnPlayerJoinTeam(i32 team)
+{
+	if (this->teamJoinedAtLeastOnce || (team != CS_TEAM_CT && team != CS_TEAM_T))
+	{
+		return;
+	}
+
+	this->teamJoinedAtLeastOnce = true;
+	if (g_pMultiAddonManager)
+	{
+		this->player->languageService->PrintChat(true, false, "Menu Hint");
+	}
+
+	this->player->globalService->PrintAnnouncements();
+
+	StartTimer<CPlayerUserId>(KZAnticheatService::PrintWarning, this->player->GetClient()->GetUserID(), 1.0f, false, false);
+}

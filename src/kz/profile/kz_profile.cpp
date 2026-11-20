@@ -1,0 +1,325 @@
+#include "kz_profile.h"
+#include "cs2kz.h"
+#include "utils/http.h"
+#include "kz/anticheat/kz_anticheat.h"
+#include "kz/mode/kz_mode.h"
+#include "kz/style/kz_style.h"
+#include "kz/option/kz_option.h"
+
+#include "sdk/recipientfilters.h"
+#include "public/networksystem/inetworkmessages.h"
+
+enum Ranks
+{
+	Unknown = 0,
+	New,
+	Beginner,
+	Casual,
+	Regular,
+	Skilled,
+	Expert,
+	Semipro,
+	Pro,
+	Master,
+	Legend,
+	NUM_RANKS
+};
+
+static_global const char *rankNames[NUM_RANKS] = {
+	"Unknown", "New", "Beginner", "Casual", "Regular", "Skilled", "Expert", "Semipro", "Pro", "Master", "Legend",
+};
+
+static_global const f32 rankThresholds[NUM_RANKS] = {
+	-1.0f,     // Unknown
+	0.0f,      // New
+	0.000001f, // Beginner
+	5000.0f,   // Casual
+	10000.0f,  // Regular
+	15000.0f,  // Skilled
+	20000.0f,  // Expert
+	25000.0f,  // Semipro
+	30000.0f,  // Pro
+	35000.0f,  // Master
+	37500.0f   // Legend
+};
+
+static_global const char *rankColors[NUM_RANKS] = {
+	"{default}",  // Unknown
+	"{grey}",     // New
+	"{grey}",     // Beginner
+	"{blue}",     // Casual
+	"{darkblue}", // Regular
+	"{darkblue}", // Skilled
+	"{orchid}",   // Expert
+	"{red}",      // Semipro
+	"{yellow}",   // Pro
+	"{gold}",     // Master
+	"{gold}"      // Legend
+};
+
+#define RATING_REFRESH_PERIOD 120.0f // seconds
+
+CConVar<bool> kz_profile_rating_badge_enabled("kz_profile_rating_badge_enabled", FCVAR_NONE, "Whether to show competitive rank in scoreboard.", true);
+
+static_function void OnClantagEnabledChanged(CConVar<bool> *ref, CSplitScreenSlot nSlot, const bool *newValue, const bool *oldValue)
+{
+	if (g_KZPlugin.loading || g_KZPlugin.unloading)
+	{
+		return;
+	}
+	for (KZPlayer *player : g_pKZPlayerManager->GetAllSlots())
+	{
+		if (player->profileService)
+		{
+			player->profileService->UpdateClantag();
+		}
+	}
+}
+
+CConVar<bool> kz_profile_clantag_enabled("kz_profile_clantag_enabled", FCVAR_NONE,
+										 "Whether to set the player's clan tag (mode and rank) in the scoreboard.", true, OnClantagEnabledChanged);
+
+void KZProfileService::OnPlayerActive()
+{
+	CReliableSingleUserRecipientFilter filter(this->player->GetPlayerSlot());
+	INetworkMessageInternal *netmsg = g_pNetworkMessages->FindNetworkMessagePartial("CCSUsrMsg_ServerRankRevealAll");
+	CNetMessage *msg = netmsg->AllocateMessage();
+	interfaces::pGameEventSystem->PostEventAbstract(0, false, &filter, netmsg, msg, 0);
+	delete msg;
+}
+
+void KZProfileService::OnCheckTransmit()
+{
+	if (!kz_profile_rating_badge_enabled.Get())
+	{
+		return;
+	}
+	for (KZPlayer *player : g_pKZPlayerManager->GetInGamePlayers())
+	{
+		player->profileService->UpdateCompetitiveRank();
+	}
+}
+
+void KZProfileService::RequestRating()
+{
+	if (!KZGlobalService::IsAvailable())
+	{
+		return;
+	}
+	if (!this->player->IsAuthenticated() || !this->player->IsConnected())
+	{
+		KZ_LOG_DEBUG(LogChannel::Profile, "Player %s not authenticated or not connected, cannot request rating.\n", this->player->GetName());
+		return;
+	}
+	KZ::api::Mode mode;
+	if (!KZ::api::DecodeModeString(this->player->modeService->GetModeShortName(), mode))
+	{
+		KZ_LOG_DEBUG(LogChannel::Profile, "Player %s has invalid mode '%s', cannot request rating.\n", this->player->GetName(),
+					 this->player->modeService->GetModeShortName());
+		return;
+	}
+	this->desiredMode = static_cast<u8>(mode);
+	u64 steamID64 = this->player->GetSteamId64();
+	if (steamID64 == 0)
+	{
+		KZ_LOG_DEBUG(LogChannel::Profile, "Player %s has invalid SteamID, cannot request rating.\n", this->player->GetName());
+		return;
+	}
+	if (!this->player->styleServices.empty())
+	{
+		KZ_LOG_DEBUG(LogChannel::Profile, "Player %s has styles enabled, skipping rating request.\n", this->player->GetName());
+		return;
+	}
+	this->timeToNextRatingRefresh = Plat_FloatTime() + RATING_REFRESH_PERIOD + RandomFloat(-30.0f, 30.0f);
+	std::string apiURL = std::string(KZOptionService::GetOptionStr("apiUrl", "https://api.cs2kz.org"));
+	// Removing trailing slash if present to avoid double slashes in the URL.
+	if (!apiURL.empty() && apiURL.back() == '/')
+	{
+		apiURL.pop_back();
+	}
+	std::string url = apiURL + "/players/" + std::to_string(steamID64);
+	HTTP::Request request(HTTP::Method::GET, url);
+	KZ_LOG_DEBUG(LogChannel::Profile, "Requesting rating for player %s (%llu) in mode %d.\n", this->player->GetName(), steamID64,
+				 static_cast<u8>(mode));
+	auto callback = [steamID64, mode](HTTP::Response response)
+	{
+		KZ_LOG_DEBUG(LogChannel::Profile, "Received response for player %llu: status %d.\n", steamID64, response.status);
+		if (response.status != 200)
+		{
+			KZ_LOG_DEBUG(LogChannel::Profile, "Non-200 response for player %llu: status %d.\n", steamID64, response.status);
+			return;
+		}
+		KZPlayer *player = g_pKZPlayerManager->SteamIdToPlayer(steamID64);
+		if (player == nullptr)
+		{
+			KZ_LOG_DEBUG(LogChannel::Profile, "Player not found for SteamID %llu.\n", steamID64);
+			return;
+		}
+		// The player mode has changed since the request was made.
+		if (player->profileService->desiredMode != static_cast<u8>(mode))
+		{
+			KZ_LOG_DEBUG(LogChannel::Profile, "Player %s mode changed since request, ignoring response.\n", player->GetName());
+			return;
+		}
+		Json json(response.Body().value_or(""));
+
+		const char *ratingField = (mode == KZ::api::Mode::Classic) ? "ckz_rating" : "vnl_rating";
+		f32 oldRating = player->profileService->currentRating;
+
+		if (!json.Get(ratingField, player->profileService->currentRating))
+		{
+			KZ_LOG_DEBUG(LogChannel::Profile, "Failed to parse rating from response for player %s.\n", player->GetName());
+			return;
+		}
+		if (oldRating <= 0.0f && player->profileService->currentRating > 0.0f)
+		{
+			CInGameRecipientFilter filter;
+			INetworkMessageInternal *netmsg = g_pNetworkMessages->FindNetworkMessagePartial("CCSUsrMsg_ServerRankRevealAll");
+			CNetMessage *msg = netmsg->AllocateMessage();
+			interfaces::pGameEventSystem->PostEventAbstract(0, false, &filter, netmsg, msg, 0);
+			delete msg;
+		}
+		KZ_LOG_DEBUG(LogChannel::Profile, "Updating rating for player %s: %.2f.\n", player->GetName(), player->profileService->currentRating);
+		player->profileService->UpdateCompetitiveRank();
+		player->profileService->UpdateClantag();
+	};
+	request.Send(callback);
+}
+
+bool KZProfileService::CanDisplayRank()
+{
+	// Haven't obtained rating yet.
+	if (this->currentRating < 0.0f)
+	{
+		return false;
+	}
+	// No rating if styles are enabled.
+	if (!this->player->styleServices.empty())
+	{
+		return false;
+	}
+	// No rating if player is banned.
+	if (this->player->anticheatService->isBanned)
+	{
+		return false;
+	}
+	KZ::api::Mode mode;
+	return KZ::api::DecodeModeString(this->player->modeService->GetModeShortName(), mode);
+}
+
+void KZProfileService::SetClanTagOverride(const char *tag)
+{
+	V_strncpy(this->clanTagOverride, tag ? tag : "", sizeof(this->clanTagOverride));
+	this->UpdateClantag();
+}
+
+void KZProfileService::UpdateClantag()
+{
+	if (!this->player->IsConnected()
+		|| (this->player->GetController() && this->player->GetController()->m_iConnected() != PlayerConnectedState::PlayerConnected))
+	{
+		if (this->player->GetController() && V_strlen(this->player->GetController()->m_szClan().String()) > 0)
+		{
+			this->SetClantag("");
+		}
+		return;
+	}
+
+	if (this->clanTagOverride[0] != '\0')
+	{
+		this->SetClantag(this->clanTagOverride);
+		return;
+	}
+	if (!kz_profile_clantag_enabled.Get())
+	{
+		if (this->player->GetController() && this->clanTag[0] != '\0' && KZ_STREQ(this->player->GetController()->m_szClan().String(), this->clanTag))
+		{
+			this->SetClantag("");
+		}
+		return;
+	}
+	if (this->CanDisplayRank())
+	{
+		i32 rank = Ranks::Unknown;
+		for (i32 i = Ranks::NUM_RANKS - 1; i >= 0; i--)
+		{
+			if (this->currentRating >= rankThresholds[i])
+			{
+				rank = i;
+				break;
+			}
+		}
+		// The client wraps clan tags in brackets itself.
+		V_snprintf(this->clanTag, sizeof(this->clanTag), "%s %s", this->player->modeService->GetModeShortName(), rankNames[rank]);
+	}
+	else
+	{
+		V_snprintf(this->clanTag, sizeof(this->clanTag), "%s%s", this->player->modeService->GetModeShortName(),
+				   !this->player->styleServices.empty() ? "*" : "");
+	}
+
+	if (this->clanTag[0] == '\0')
+	{
+		return;
+	}
+	this->SetClantag(this->clanTag);
+}
+
+void KZProfileService::OnPhysicsSimulatePost()
+{
+	if (Plat_FloatTime() >= this->timeToNextRatingRefresh)
+	{
+		this->RequestRating();
+	}
+
+	// The server overwrites m_szClan with the player's Steam group tag once their GC persona data arrives.
+	CCSPlayerController *controller = this->player->GetController();
+	bool ownsClanTag = this->clanTagOverride[0] != '\0' || kz_profile_clantag_enabled.Get();
+	if (ownsClanTag && this->clanTag[0] != '\0' && controller && controller->m_iConnected() == PlayerConnectedState::PlayerConnected
+		&& !KZ_STREQ(controller->m_szClan().String(), this->clanTag))
+	{
+		this->player->SetClan(this->clanTag);
+	}
+}
+
+void KZProfileService::UpdateCompetitiveRank()
+{
+	if (!this->player->IsInGame() || !kz_profile_rating_badge_enabled.GetBool() || !this->player->GetController())
+	{
+		return;
+	}
+	i32 rating = this->CanDisplayRank() ? static_cast<i32>(floor(this->currentRating)) : 0;
+	this->player->GetController()->m_iCompetitiveRankType(11);
+	this->player->GetController()->m_iCompetitiveRanking(rating);
+}
+
+std::string KZProfileService::GetPrefix(bool colors)
+{
+	if (this->chatPrefixOverride[0] != '\0')
+	{
+		return this->chatPrefixOverride;
+	}
+	if (this->clanTag[0] == '\0')
+	{
+		this->UpdateClantag();
+	}
+	if (this->CanDisplayRank())
+	{
+		i32 rank = Ranks::Unknown;
+		for (i32 i = Ranks::NUM_RANKS - 1; i >= 0; i--)
+		{
+			if (this->currentRating >= rankThresholds[i])
+			{
+				rank = i;
+				break;
+			}
+		}
+		return std::string(colors ? rankColors[rank] : "") + "[" + this->player->modeService->GetModeShortName() + " " + rankNames[rank]
+			   + (colors ? "]{default}" : "]");
+	}
+	else
+	{
+		return std::string(colors ? "{default}[" : "[") + this->player->modeService->GetModeShortName()
+			   + (!this->player->styleServices.empty() ? "*" : "") + (colors ? "]{default}" : "]");
+	}
+}

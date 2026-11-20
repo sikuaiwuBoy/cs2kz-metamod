@@ -1,0 +1,486 @@
+#include "cs2kz.h"
+#include "kz_recording.h"
+#include "kz/timer/kz_timer.h"
+#include "kz/checkpoint/kz_checkpoint.h"
+#include "kz/replays/kz_replaysystem.h"
+#include "kz/global/kz_global.h"
+#include "kz/option/kz_option.h"
+
+extern CConVar<i32> kz_replay_recording_min_jump_tier;
+
+// Timer event listener implementation
+class TimerEventListener : public KZTimerServiceEventListener
+{
+public:
+	virtual void OnTimerStartPost(KZPlayer *player, u32 courseGUID) override
+	{
+		player->recordingService->OnTimerStart();
+	}
+
+	virtual void OnTimerEndPost(KZPlayer *player, u32 courseGUID, f32 time, u32 teleportsUsed) override
+	{
+		player->recordingService->OnTimerEnd();
+	}
+
+	virtual void OnTimerStopped(KZPlayer *player, u32 courseGUID) override
+	{
+		player->recordingService->OnTimerStop();
+	}
+
+	virtual void OnTimerInvalidated(KZPlayer *player) override
+	{
+		// player->PrintChat(false, false, "timerinvalidated");
+	}
+
+	virtual void OnPausePost(KZPlayer *player) override
+	{
+		player->recordingService->OnPause();
+	}
+
+	virtual void OnResumePost(KZPlayer *player) override
+	{
+		player->recordingService->OnResume();
+	}
+
+	virtual void OnSplitZoneTouchPost(KZPlayer *player, u32 splitZone) override
+	{
+		player->recordingService->OnSplit(splitZone);
+	}
+
+	virtual void OnCheckpointZoneTouchPost(KZPlayer *player, u32 checkpoint) override
+	{
+		player->recordingService->OnCPZ(checkpoint);
+	}
+
+	virtual void OnStageZoneTouchPost(KZPlayer *player, u32 stageZone) override
+	{
+		player->recordingService->OnStage(stageZone);
+	}
+} timerEventListener;
+
+void KZRecordingService::Init()
+{
+	KZTimerService::RegisterEventListener(&timerEventListener);
+	fileWriter = new ReplayFileWriter();
+}
+
+void KZRecordingService::Shutdown()
+{
+	KZTimerService::UnregisterEventListener(&timerEventListener);
+	fileWriter->Stop();
+	delete fileWriter;
+	fileWriter = nullptr;
+}
+
+void KZRecordingService::OnActivateServer()
+{
+	for (KZPlayer *player : g_pKZPlayerManager->GetAllSlots())
+	{
+		if (player->recordingService)
+		{
+			player->recordingService->Reset();
+		}
+	}
+}
+
+void KZRecordingService::ProcessFileWriteCompletion()
+{
+	if (KZRecordingService::fileWriter)
+	{
+		KZRecordingService::fileWriter->RunFrame();
+	}
+}
+
+void KZRecordingService::OnProcessUsercmds(CUserCmd *cmds, i32 numCmds)
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	if (numCmds <= 0)
+	{
+		return;
+	}
+
+	// record data for replay playback
+	if (this->player->IsFakeClient())
+	{
+		return;
+	}
+
+	this->RecordCommand(cmds, numCmds);
+}
+
+void KZRecordingService::OnTimerStart()
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+
+	// Skip recording run replays only when the API has confirmed the map is not global.
+	// If the API response is still pending, we record anyway to avoid missing replays on global maps.
+	if (!KZOptionService::GetOptionInt("recordNonGlobalRuns", true) && KZGlobalService::IsCurrentMapConfirmedNotGlobal())
+	{
+		KZ_LOG_DEBUG(LogChannel::Recording, "Skipping run recorder: map is not global and kz_replay_record_nonglobal_runs is false\n");
+		this->InsertTimerEvent(RpEvent::RpEventData::TimerEvent::TIMER_START, this->player->timerService->GetTime(),
+							   this->player->timerService->GetCourse()->id);
+		// Assign a random UUID for local database saving.
+		this->currentRunUUID = UUID_t();
+		return;
+	}
+
+	this->runRecorders.push_back(RunRecorder(this->player));
+	KZ_LOG_DEBUG(LogChannel::Recording, "Timer start\n");
+	this->InsertTimerEvent(RpEvent::RpEventData::TimerEvent::TIMER_START, this->player->timerService->GetTime(),
+						   this->player->timerService->GetCourse()->id);
+	// Reset currentRunUUID to invalid state at timer start
+	this->currentRunUUID = UUID_t(false);
+}
+
+void KZRecordingService::OnTimerStop()
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	KZ_LOG_DEBUG(LogChannel::Recording, "Timer stop\n");
+	this->InsertTimerEvent(RpEvent::RpEventData::TimerEvent::TIMER_STOP, this->player->timerService->GetTime());
+
+	// Remove all active run recorders, which are the ones without desired stop time set.
+	auto it = this->runRecorders.begin();
+	while (it != this->runRecorders.end())
+	{
+		if (it->desiredStopTime < 0.0f)
+		{
+			it = this->runRecorders.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+}
+
+void KZRecordingService::OnTimerEnd()
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	KZ_LOG_DEBUG(LogChannel::Recording, "Timer end\n");
+	this->InsertTimerEvent(RpEvent::RpEventData::TimerEvent::TIMER_END, this->player->timerService->GetTime(),
+						   this->player->timerService->GetCourse()->id);
+
+	for (auto &recorder : this->runRecorders)
+	{
+		if (recorder.desiredStopTime < 0.0f)
+		{
+			recorder.End(this->player->timerService->GetTime(), this->player->checkpointService->GetTeleportCount());
+			// Generate UUID now (at timer end) so it's available for RecordAnnounce
+			// File will be written later after breather time
+			recorder.uuid = UUID_t(true);
+			this->currentRunUUID = recorder.uuid;
+		}
+	}
+}
+
+void KZRecordingService::OnPause()
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	KZ_LOG_DEBUG(LogChannel::Recording, "Timer pause\n");
+	this->InsertTimerEvent(RpEvent::RpEventData::TimerEvent::TIMER_PAUSE,
+						   this->player->timerService->GetTimerRunning() ? this->player->timerService->GetTime() : 0.0f);
+}
+
+void KZRecordingService::OnResume()
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	KZ_LOG_DEBUG(LogChannel::Recording, "Timer resume\n");
+	this->InsertTimerEvent(RpEvent::RpEventData::TimerEvent::TIMER_RESUME,
+						   this->player->timerService->GetTimerRunning() ? this->player->timerService->GetTime() : 0.0f);
+}
+
+void KZRecordingService::OnSplit(i32 split)
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	KZ_LOG_DEBUG(LogChannel::Recording, "Timer split %d\n", split);
+	this->InsertTimerEvent(RpEvent::RpEventData::TimerEvent::TIMER_SPLIT, this->player->timerService->GetTime(), split);
+}
+
+void KZRecordingService::OnCPZ(i32 cpz)
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	KZ_LOG_DEBUG(LogChannel::Recording, "Checkpoint %d\n", cpz);
+	this->InsertTimerEvent(RpEvent::RpEventData::TimerEvent::TIMER_CPZ, this->player->timerService->GetTime(), cpz);
+}
+
+void KZRecordingService::OnStage(i32 stage)
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	KZ_LOG_DEBUG(LogChannel::Recording, "Stage %d\n", stage);
+	this->InsertTimerEvent(RpEvent::RpEventData::TimerEvent::TIMER_STAGE, this->player->timerService->GetTime(), stage);
+}
+
+void KZRecordingService::OnTeleport(const Vector *origin, const QAngle *angles, const Vector *velocity)
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	// Logical teleports may use separate engine calls for angles, velocity and
+	// position. Their begin/end pair owns one event; raw teleports are recorded here.
+	if (this->teleportDepth == 0)
+	{
+		this->InsertTeleportEvent(origin, angles, velocity);
+	}
+}
+
+void KZRecordingService::SaveTurnbindJump(Jump *jump)
+{
+	if (jump->IsFailstat() || jump->GetOffset() < -JS_EPSILON || jump->airtime < 0.5f || !this->player->styleServices.empty()
+		|| jump->jumpType < JumpType_LongJump || jump->jumpType > JumpType_Fall
+		|| this->player->modeService->GetDistanceTier(jump->jumpType, jump->GetDistance()) < kz_replay_recording_min_jump_tier.Get())
+	{
+		return;
+	}
+	this->EnsureCircularRecorderInitialized();
+	RpJumpStats rpJump;
+	RpJumpStats::FromJump(rpJump, jump);
+	JumpRecorder &recorder = this->jumpRecorders.emplace_back(jump);
+	recorder.uuid = UUID_t(true);
+	recorder.PushData(rpJump);
+	KZ_LOG_INFO(LogChannel::AC, "Recording turn bind jump replay %s for player %s (%llu): %s %.4f\n", recorder.uuid.ToString().c_str(),
+				this->player->GetName(), this->player->GetSteamId64(), jumpTypeShortStr[jump->jumpType], jump->GetDistance());
+}
+
+void KZRecordingService::OnJumpFinish(Jump *jump)
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	if (jump->usedExternalTurnbind)
+	{
+		this->SaveTurnbindJump(jump);
+		return;
+	}
+	if (jump->IsFailstat() || !jump->IsValid() || jump->GetOffset() < -JS_EPSILON)
+	{
+		return;
+	}
+	this->lastJumpUUID = UUID_t(true);
+	// If the player has a style, ignore it.
+	if (!this->player->styleServices.empty())
+	{
+		return;
+	}
+	// If a jump is way too short, ignore it.
+	if (jump->airtime < 0.5f)
+	{
+		return;
+	}
+	KZ_LOG_DEBUG(LogChannel::Recording, "Jump finish\n");
+	this->EnsureCircularRecorderInitialized();
+	RpJumpStats rpJump;
+	RpJumpStats::FromJump(rpJump, jump);
+	this->circularRecording->jumps.push_back(rpJump);
+
+	// Only write the jump if it's ownage or better to save storage for run replays.
+	if (jump->IsValid() && jump->GetJumpPlayer()->modeService->GetDistanceTier(jump->jumpType, jump->GetDistance()) >= DistanceTier_Ownage)
+	{
+		this->PushToRecorders(rpJump, RecorderType::Run);
+	}
+	// Add to all active jump recorders.
+	this->PushToRecorders(rpJump, RecorderType::Jump);
+	// Create a new jump recorder if the jump is good enough.
+	if (jump->IsValid() && jump->GetOffset() >= -JS_EPSILON
+		&& jump->GetJumpPlayer()->modeService->GetDistanceTier(jump->jumpType, jump->GetDistance()) >= kz_replay_recording_min_jump_tier.Get())
+	{
+		this->jumpRecorders.push_back(JumpRecorder(jump));
+		this->jumpRecorders.back().uuid = this->lastJumpUUID;
+	}
+}
+
+void KZRecordingService::OnCheckpointSave(i32 index, const Vector &origin)
+{
+	if (!this->player->IsFakeClient() && !KZ::replaysystem::IsReplayBot(this->player))
+	{
+		this->InsertCheckpointEvent(RpEvent::RpEventData::CheckpointEvent::CHECKPOINT_SAVE, index, origin);
+	}
+}
+
+void KZRecordingService::OnTeleportBegin(const Vector *origin, const QAngle *angles, const Vector *velocity)
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	if (this->teleportDepth++ == 0)
+	{
+		// SetAngles sends a zero pitch to the entity teleport and snaps view angles
+		// separately. The merged event must retain that entity-angle behavior.
+		QAngle absoluteAngles = angles ? *angles : vec3_angle;
+		absoluteAngles.x = 0;
+		this->teleportEvent = this->CreateTeleportEvent(origin, angles ? &absoluteAngles : nullptr, velocity);
+	}
+}
+
+void KZRecordingService::OnTeleportEnd()
+{
+	if (KZ::replaysystem::IsReplayBot(this->player) || this->teleportDepth == 0)
+	{
+		return;
+	}
+	if (--this->teleportDepth == 0)
+	{
+		this->InsertEvent(this->teleportEvent);
+	}
+}
+
+void KZRecordingService::OnCheckpointReset()
+{
+	if (!this->circularRecording && this->runRecorders.empty() && this->jumpRecorders.empty())
+	{
+		return;
+	}
+	if (!this->player->IsFakeClient() && !KZ::replaysystem::IsReplayBot(this->player))
+	{
+		this->InsertCheckpointEvent(RpEvent::RpEventData::CheckpointEvent::CHECKPOINT_RESET, 0, vec3_origin);
+	}
+}
+
+void KZRecordingService::OnControlChange(RpEvent::RpEventData::ControlEvent::ControlEventType type)
+{
+	if (this->player->IsFakeClient() || KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	KZ_LOG_DEBUG(LogChannel::Recording, "Control change %d\n", type);
+	RpEvent event = this->CreateEvent(RPEVENT_CONTROL);
+	event.data.control.type = type;
+	Vector origin;
+	this->player->GetOrigin(&origin);
+	for (i32 i = 0; i < 3; i++)
+	{
+		event.data.control.origin[i] = origin[i];
+	}
+	this->InsertEvent(event);
+}
+
+void KZRecordingService::OnClientDisconnect()
+{
+	for (auto &recorder : this->runRecorders)
+	{
+		if (recorder.desiredStopTime > 0.0f && KZRecordingService::fileWriter)
+		{
+			auto recorderPtr = std::make_unique<RunRecorder>(std::move(recorder));
+			this->CopyWeaponsToRecorder(recorderPtr.get());
+			UUID_t localUUID = recorderPtr->uuid;
+			// clang-format off
+			KZRecordingService::fileWriter->QueueWrite(
+				std::move(recorderPtr),
+				[localUUID](const UUID_t &, f32, std::vector<char> &&buffer)
+				{
+					RunSubmission *sub = RunSubmission::GetByUUID(localUUID);
+					if (sub)
+					{
+						sub->OnReplayReady(std::move(buffer));
+					}
+				},
+				[localUUID](const char *error)
+				{ 
+					KZ_LOG_WARN(LogChannel::Recording, "Run replay serialization failed for UUID %s: %s\n", localUUID.ToString().c_str(), error);
+				});
+			// clang-format on
+		}
+	}
+	this->runRecorders.clear();
+	for (auto &recorder : this->jumpRecorders)
+	{
+		if (KZRecordingService::fileWriter)
+		{
+			auto recorderPtr = std::make_unique<JumpRecorder>(std::move(recorder));
+			this->CopyWeaponsToRecorder(recorderPtr.get());
+			KZRecordingService::fileWriter->QueueWriteToFile(std::move(recorderPtr));
+		}
+	}
+	this->jumpRecorders.clear();
+
+	// Clean up circular recorder when player disconnects
+	delete this->circularRecording;
+	this->circularRecording = nullptr;
+}
+
+void KZRecordingService::OnPhysicsSimulate()
+{
+	this->physicsSimulationActive = false;
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+
+	// record data for replay playback
+	if (!this->player->IsAlive() || this->player->IsFakeClient())
+	{
+		return;
+	}
+
+	this->RecordTickData_PhysicsSimulate();
+}
+
+void KZRecordingService::OnSetupMove(CUserCmd *pc)
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+	if (!this->player->IsAlive() || this->player->IsFakeClient())
+	{
+		return;
+	}
+	this->RecordTickData_SetupMove(pc);
+}
+
+void KZRecordingService::OnPhysicsSimulatePost()
+{
+	this->physicsSimulationActive = false;
+	if (this->player->IsFakeClient() || KZ::replaysystem::IsReplayBot(this->player))
+	{
+		return;
+	}
+
+	this->CheckRecorders();
+
+	// record data for replay playback
+	if (!this->player->IsAlive())
+	{
+		return;
+	}
+	this->CheckWeapons();
+	this->CheckCheckpoints();
+	this->RecordTickData_PhysicsSimulatePost();
+	this->CheckModeStyles();
+
+	// Remove old events from circular buffer (keep 2 minutes)
+	u32 currentTick = g_pKZUtils->GetServerGlobals()->tickcount;
+	if (this->circularRecording)
+	{
+		this->circularRecording->TrimOldData(currentTick);
+	}
+}

@@ -1,0 +1,638 @@
+#include "cs2kz.h"
+#include "data.h"
+#include "filesystem/ifilesystem.h"
+#include "utils/utils.h"
+#include "utils/uuid.h"
+#include "compression.h"
+#include "parsing.h"
+#include <thread>
+#include <mutex>
+#include <atomic>
+
+CConVar<bool> kz_replay_playback_skins_enable("kz_replay_playback_skins_enable", FCVAR_NONE, "Enables applying player skins during replay playback.",
+											  true);
+
+static KZ::replaysystem::data::ReplayPlayback g_currentReplay = {};
+static KZ::replaysystem::data::AsyncLoadStatus g_loadStatus = {};
+static std::thread g_loadThread;
+static std::atomic<bool> g_cancelLoad {false};
+static_global i32 botTickcount;
+
+namespace KZ::replaysystem::data
+{
+	void FreeReplayData(ReplayPlayback *replay)
+	{
+		if (replay->ticks)
+		{
+			delete replay->ticks;
+			replay->ticks = nullptr;
+		}
+		if (replay->subtickOffsets)
+		{
+			delete[] replay->subtickOffsets;
+			replay->subtickOffsets = nullptr;
+		}
+		if (replay->subtickMoves)
+		{
+			delete[] replay->subtickMoves;
+			replay->subtickMoves = nullptr;
+		}
+		if (replay->weapons)
+		{
+			delete[] replay->weapons;
+			replay->weapons = nullptr;
+		}
+		if (replay->weaponIndices)
+		{
+			delete[] replay->weaponIndices;
+			replay->weaponIndices = nullptr;
+		}
+		if (replay->jumps)
+		{
+			delete[] replay->jumps;
+			replay->jumps = nullptr;
+		}
+		if (replay->events)
+		{
+			delete[] replay->events;
+			replay->events = nullptr;
+		}
+		*replay = {};
+	}
+
+	TickData GetTick(const ReplayPlayback *replay, u32 index)
+	{
+		return replay->ticks->Get(index);
+	}
+
+	u32 GetTickAtServerTick(const ReplayPlayback *replay, u32 serverTick)
+	{
+		// Ticks are recorded in server tick order, so the keyframes can be binary searched.
+		return replay->ticks->FindServerTick(serverTick);
+	}
+
+	void ResetReplayState(ReplayPlayback *replay)
+	{
+		// Reset all tracking indices
+		replay->currentJump = 0;
+		replay->currentEvent = 0;
+
+		// Reset checkpoint/teleport counters
+		replay->currentCpIndex = -1;
+		replay->currentCheckpoint = 0;
+		replay->currentTeleport = 0;
+
+		// Reset timer state
+		replay->courseName[0] = '\0';
+		replay->startTime = 0.0f;
+		replay->paused = false;
+		replay->endTime = 0.0f;
+		replay->stopTick = 0;
+		replay->lastSplitTime = 0.0f;
+		replay->lastCPZTime = 0.0f;
+		replay->lastStageTime = 0.0f;
+
+		// Reset replay pause state
+		replay->replayPaused = false;
+		replay->tickProgress = 0.0f;
+		replay->stepTicks = 0;
+	}
+
+	ReplayPlayback *GetCurrentReplay()
+	{
+		return &g_currentReplay;
+	}
+
+	bool IsReplayValid()
+	{
+		return g_currentReplay.valid;
+	}
+
+	bool IsReplayPlaying()
+	{
+		return g_currentReplay.playingReplay;
+	}
+
+	i32 GetCurrentCpIndex()
+	{
+		return g_currentReplay.currentCpIndex;
+	}
+
+	i32 GetCheckpointCount()
+	{
+		return g_currentReplay.currentCheckpoint;
+	}
+
+	i32 GetTeleportCount()
+	{
+		return g_currentReplay.currentTeleport;
+	}
+
+	f32 GetReplayTime()
+	{
+		return g_currentReplay.startTime == 0.0f ? 0.0f : (GetBotCurtime() - g_currentReplay.startTime);
+	}
+
+	i32 GetBotTickcount()
+	{
+		return botTickcount;
+	}
+
+	void SetBotTickcount(i32 tick)
+	{
+		botTickcount = tick;
+	}
+
+	f32 GetBotCurtime()
+	{
+		return botTickcount * ENGINE_FIXED_TICK_INTERVAL;
+	}
+
+	f32 GetEndTime()
+	{
+		if (g_currentReplay.stopTick == 0)
+		{
+			return 0.0f;
+		}
+		if (g_currentReplay.stopTick + 192 < g_currentReplay.currentTick) // 3 seconds
+		{
+			return 0.0f;
+		}
+		return g_currentReplay.endTime;
+	}
+
+	bool GetPaused()
+	{
+		return g_currentReplay.paused;
+	}
+
+	const char *GetCourseName()
+	{
+		return g_currentReplay.courseName;
+	}
+
+	static_function void UpdateProgress(const char *cursor, const char *dataStart, size_t totalSize, std::atomic<f32> &progress)
+	{
+		if (totalSize > 0)
+		{
+			size_t bytesRead = static_cast<size_t>(cursor - dataStart);
+			progress = static_cast<f32>(bytesRead) / static_cast<f32>(totalSize);
+			KZ_LOG_DEBUG(LogChannel::Replays, "Replay load progress: %zu bytes, %.2f%%\n", bytesRead, progress.load() * 100.0f);
+		}
+	}
+
+	static_function bool ReadHeader(const char *&cursor, const char *end, ReplayHeader &header)
+	{
+		// Try to read header size (u32). If this fails, the data is invalid or corrupted.
+		if (cursor + (ptrdiff_t)sizeof(u32) > end)
+		{
+			return false;
+		}
+		u32 headerSize = 0;
+		memcpy(&headerSize, cursor, sizeof(headerSize));
+		cursor += sizeof(headerSize);
+
+		if (headerSize == 0 || headerSize > 5 * 1024 * 1024) // sanity limit 5MB
+		{
+			return false;
+		}
+		if (cursor + (ptrdiff_t)headerSize > end)
+		{
+			return false;
+		}
+
+		std::string serialized(cursor, cursor + headerSize);
+		cursor += headerSize;
+
+		if (!header.ParseFromString(serialized))
+		{
+			return false;
+		}
+
+		if (!parsing::GetVersionParser(header.version()))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	// Parses replay data from an in-memory byte array.
+	static_function ReplayPlayback LoadReplayFromMemory(const char *data, size_t size, UUID_t uuid, std::atomic<f32> &progress,
+														std::atomic<bool> &shouldCancel)
+	{
+		ReplayPlayback result = {};
+		progress = 0.0f;
+
+		const char *cursor = data;
+		const char *end = data + size;
+
+		// Read length-prefixed protobuf header
+		if (shouldCancel)
+		{
+			return result;
+		}
+		KZ_LOG_DEBUG(LogChannel::Replays, "Loading replay protobuf header...\n");
+
+		if (!ReadHeader(cursor, end, result.header))
+		{
+			return result;
+		}
+
+		UpdateProgress(cursor, data, size, progress);
+
+		// Load tick data
+		if (shouldCancel)
+		{
+			return result;
+		}
+		KZ_LOG_DEBUG(LogChannel::Replays, "Loading compressed tick data...\n");
+
+		std::vector<u8> subtickCounts;
+		std::vector<SubtickData::RpSubtickMove> subtickMoves;
+
+		result.ticks = new KZ::replaysystem::compression::TickStore();
+		// Playback always reads the current tick, so a replay without ticks cannot be played.
+		if (!KZ::replaysystem::compression::ReadTickStore(cursor, end, *result.ticks, subtickCounts, subtickMoves, result.header.version())
+			|| result.ticks->Count() == 0)
+		{
+			delete result.ticks;
+			return {};
+		}
+		result.tickCount = result.ticks->Count();
+
+		// Older recordings can hold one subtick entry more than ticks; a tick without an entry has no moves.
+		result.subtickOffsets = new u64[result.tickCount + 1];
+		result.subtickOffsets[0] = 0;
+		for (u32 i = 0; i < result.tickCount; i++)
+		{
+			result.subtickOffsets[i + 1] = result.subtickOffsets[i] + (i < subtickCounts.size() ? subtickCounts[i] : 0);
+		}
+		result.subtickMoves = new SubtickData::RpSubtickMove[subtickMoves.size()];
+		std::copy(subtickMoves.begin(), subtickMoves.end(), result.subtickMoves);
+
+		UpdateProgress(cursor, data, size, progress);
+
+		// Load weapon data
+		if (shouldCancel)
+		{
+			delete result.ticks;
+			delete[] result.subtickOffsets;
+			delete[] result.subtickMoves;
+			return {};
+		}
+		KZ_LOG_DEBUG(LogChannel::Replays, "Loading weapons...\n");
+
+		std::vector<std::pair<i32, EconInfo>> weaponTableVec;
+
+		if (!KZ::replaysystem::compression::ReadWeaponsCompressed(cursor, end, weaponTableVec, result.header.version()))
+		{
+			delete result.ticks;
+			delete[] result.subtickOffsets;
+			delete[] result.subtickMoves;
+			return {};
+		}
+
+		result.weaponTableSize = weaponTableVec.size();
+		assert(result.weaponTableSize > 0);
+		result.weaponIndices = new i32[result.weaponTableSize];
+		result.weapons = new EconInfo[result.weaponTableSize];
+		for (size_t i = 0; i < weaponTableVec.size(); i++)
+		{
+			result.weaponIndices[i] = weaponTableVec[i].first;
+			result.weapons[i] = weaponTableVec[i].second;
+		}
+
+		UpdateProgress(cursor, data, size, progress);
+
+		// Load jump stats
+		if (shouldCancel)
+		{
+			delete result.ticks;
+			delete[] result.subtickOffsets;
+			delete[] result.subtickMoves;
+			delete[] result.weaponIndices;
+			delete[] result.weapons;
+			return {};
+		}
+		KZ_LOG_DEBUG(LogChannel::Replays, "Loading compressed jump stats...\n");
+
+		std::vector<RpJumpStats> jumpsVec;
+
+		if (!KZ::replaysystem::compression::ReadJumpsCompressed(cursor, end, jumpsVec, result.header.version()))
+		{
+			delete result.ticks;
+			delete[] result.subtickOffsets;
+			delete[] result.subtickMoves;
+			delete[] result.weaponIndices;
+			delete[] result.weapons;
+			return {};
+		}
+
+		result.numJumps = jumpsVec.size();
+		if (result.numJumps > 0)
+		{
+			result.jumps = new RpJumpStats[result.numJumps];
+			for (size_t i = 0; i < result.numJumps; i++)
+			{
+				result.jumps[i] = std::move(jumpsVec[i]);
+			}
+		}
+		else
+		{
+			result.jumps = nullptr;
+		}
+
+		UpdateProgress(cursor, data, size, progress);
+
+		// Load events
+		if (shouldCancel)
+		{
+			delete result.ticks;
+			delete[] result.subtickOffsets;
+			delete[] result.subtickMoves;
+			delete[] result.weaponIndices;
+			delete[] result.weapons;
+			delete[] result.jumps;
+			return {};
+		}
+		KZ_LOG_DEBUG(LogChannel::Replays, "Loading compressed events...\n");
+
+		std::vector<RpEvent> eventsVec;
+
+		if (!KZ::replaysystem::compression::ReadEventsCompressed(cursor, end, eventsVec, result.header.version()))
+		{
+			delete result.ticks;
+			delete[] result.subtickOffsets;
+			delete[] result.subtickMoves;
+			delete[] result.weaponIndices;
+			delete[] result.weapons;
+			delete[] result.jumps;
+			return {};
+		}
+
+		result.numEvents = eventsVec.size();
+		eventsVec.shrink_to_fit();
+		result.events = eventsVec.data();
+		new (&eventsVec) std::vector<RpEvent>();
+
+		UpdateProgress(cursor, data, size, progress);
+
+		result.uuid = uuid;
+		result.valid = true;
+		progress = 1.0f;
+		return result;
+	}
+
+	// Complete-file reader shared by the replay loading entry points.
+	// Replays are written under csgo/ with utils::WriteBufferToFile, and CUtlBuffer cannot hold files past 2 GiB.
+	static_function bool ReadReplayFile(const char *path, std::vector<char> &buffer, const std::atomic<bool> &cancel)
+	{
+		return !cancel && utils::ReadBufferFromFile(path, buffer) && !cancel && !buffer.empty();
+	}
+
+	bool ReadReplayMovement(const char *path, ReplayMovement &result, const std::atomic<bool> &cancel)
+	{
+		result = {};
+		std::vector<char> buffer;
+		if (!ReadReplayFile(path, buffer, cancel))
+		{
+			return false;
+		}
+		const char *cursor = buffer.data();
+		const char *end = cursor + buffer.size();
+		if (!ReadHeader(cursor, end, result.header))
+		{
+			return false;
+		}
+		// Routes need the v6 event data.
+		if (result.header.version() < 6)
+		{
+			return false;
+		}
+		compression::TickVisitor visitor = [&](const TickData &tick)
+		{
+			if (cancel)
+			{
+				return false;
+			}
+			result.samples.push_back(
+				{tick.serverTick, tick.pre.origin, tick.post.origin, tick.pre.moveType == MOVETYPE_NOCLIP, tick.post.moveType == MOVETYPE_NOCLIP});
+			return true;
+		};
+		if (!compression::ReadTickDataCompressed(cursor, end, result.header.version(), visitor))
+		{
+			return false;
+		}
+		// No weapons or jumpstats are allocated for route analysis.
+		if (!compression::SkipCompressedSection(cursor, end, result.header.version())
+			|| !compression::SkipCompressedSection(cursor, end, result.header.version()))
+		{
+			return false;
+		}
+		return !cancel && compression::ReadEventsCompressed(cursor, end, result.events, result.header.version());
+	}
+
+	// File-based entry point: reads the entire file into memory then parses.
+	static_function ReplayPlayback LoadReplayWithProgress(const char *path, std::atomic<f32> &progress, std::atomic<bool> &shouldCancel)
+	{
+		std::vector<char> buffer;
+		if (!ReadReplayFile(path, buffer, shouldCancel))
+		{
+			return {};
+		}
+		UUID_t uuid(false);
+		if (!UUID_t::FromString(utils::StripExtension(utils::GetBaseFilename(path)).c_str(), &uuid))
+		{
+			return {};
+		}
+		return LoadReplayFromMemory(buffer.data(), buffer.size(), uuid, progress, shouldCancel);
+	}
+
+	// Memory-based entry point: parse directly from a provided buffer.
+	static_function ReplayPlayback LoadReplayWithProgress(const char *data, size_t size, UUID_t uuid, std::atomic<f32> &progress,
+														  std::atomic<bool> &shouldCancel)
+	{
+		return LoadReplayFromMemory(data, size, uuid, progress, shouldCancel);
+	}
+
+	// Cancels the running load (if any) and waits for its thread to exit, so only one loader can
+	// ever touch g_loadStatus at a time.
+	static_function void StopLoadThread()
+	{
+		g_cancelLoad = true;
+		if (g_loadThread.joinable())
+		{
+			g_loadThread.join();
+		}
+		g_cancelLoad = false;
+	}
+
+	static_function void PrepareAsyncLoad(LoadSuccessCallback onSuccess, LoadFailureCallback onFailure)
+	{
+		StopLoadThread();
+		g_loadStatus.state = LoadingState::Loading;
+		g_loadStatus.progress = 0.0f;
+		{
+			std::lock_guard<std::mutex> lock(g_loadStatus.callbackMutex);
+			g_loadStatus.successCallback = onSuccess;
+			g_loadStatus.failureCallback = onFailure;
+		}
+		{
+			std::lock_guard<std::mutex> lock(g_loadStatus.errorMutex);
+			g_loadStatus.errorMessage.clear();
+		}
+		{
+			std::lock_guard<std::mutex> lock(g_loadStatus.replayMutex);
+			FreeReplayData(&g_loadStatus.completedReplay);
+			g_loadStatus.completedReplay = {};
+		}
+	}
+
+	static_function void HandleAsyncResult(ReplayPlayback &result)
+	{
+		if (g_cancelLoad)
+		{
+			// Load was cancelled, cleanup and exit
+			FreeReplayData(&result);
+			g_loadStatus.state = LoadingState::Failed;
+			{
+				std::lock_guard<std::mutex> lock(g_loadStatus.errorMutex);
+				g_loadStatus.errorMessage = "Replay - Load Cancelled";
+			}
+			return;
+		}
+
+		if (!result.valid)
+		{
+			g_loadStatus.state = LoadingState::Failed;
+			{
+				std::lock_guard<std::mutex> lock(g_loadStatus.errorMutex);
+				g_loadStatus.errorMessage = "Replay - Invalid File Format";
+			}
+			return;
+		}
+
+		// Success - store result for main thread to process
+		{
+			std::lock_guard<std::mutex> lock(g_loadStatus.replayMutex);
+			FreeReplayData(&g_loadStatus.completedReplay);
+			g_loadStatus.completedReplay = result;
+		}
+		g_loadStatus.state = LoadingState::Completed;
+	}
+
+	void LoadReplayAsync(std::string path, LoadSuccessCallback onSuccess, LoadFailureCallback onFailure)
+	{
+		PrepareAsyncLoad(onSuccess, onFailure);
+		g_loadThread = std::thread(
+			[path = std::move(path)]()
+			{
+				ReplayPlayback result = LoadReplayWithProgress(path.c_str(), g_loadStatus.progress, g_cancelLoad);
+				HandleAsyncResult(result);
+			});
+	}
+
+	void LoadReplayMemoryAsync(std::vector<char> data, UUID_t uuid, LoadSuccessCallback onSuccess, LoadFailureCallback onFailure)
+	{
+		PrepareAsyncLoad(onSuccess, onFailure);
+		g_loadThread = std::thread(
+			[data = std::move(data), uuid]() mutable
+			{
+				ReplayPlayback result = LoadReplayWithProgress(data.data(), data.size(), uuid, g_loadStatus.progress, g_cancelLoad);
+				HandleAsyncResult(result);
+			});
+	}
+
+	AsyncLoadStatus *GetLoadStatus()
+	{
+		return &g_loadStatus;
+	}
+
+	bool IsLoading()
+	{
+		return g_loadStatus.state == LoadingState::Loading;
+	}
+
+	void CancelAsyncLoad()
+	{
+		if (IsLoading())
+		{
+			g_cancelLoad = true;
+		}
+	}
+
+	void Shutdown()
+	{
+		StopLoadThread();
+		std::lock_guard<std::mutex> lock(g_loadStatus.replayMutex);
+		FreeReplayData(&g_loadStatus.completedReplay);
+		FreeReplayData(&g_currentReplay);
+		g_loadStatus.state = LoadingState::Idle;
+	}
+
+	void ProcessAsyncLoadCompletion()
+	{
+		LoadingState currentState = g_loadStatus.state.load();
+
+		if (currentState == LoadingState::Completed)
+		{
+			// Handle successful load
+			ReplayPlayback completedReplay;
+			LoadSuccessCallback successCallback;
+
+			// Get the completed replay and callback
+			{
+				std::lock_guard<std::mutex> replayLock(g_loadStatus.replayMutex);
+				std::lock_guard<std::mutex> callbackLock(g_loadStatus.callbackMutex);
+
+				completedReplay = g_loadStatus.completedReplay;
+				successCallback = g_loadStatus.successCallback;
+
+				// Clear the completed replay from the status struct
+				g_loadStatus.completedReplay = {};
+			}
+
+			// Process the completion on the main thread
+			if (completedReplay.valid)
+			{
+				// Store the replay
+				FreeReplayData(&g_currentReplay);
+				g_currentReplay = completedReplay;
+
+				// Call the success callback if it exists
+				if (successCallback)
+				{
+					successCallback();
+				}
+			}
+
+			// Reset state to idle
+			g_loadStatus.state = LoadingState::Idle;
+		}
+		else if (currentState == LoadingState::Failed)
+		{
+			// Handle failed load
+			std::string errorMessage;
+			LoadFailureCallback failureCallback;
+
+			// Get the error message and callback
+			{
+				std::lock_guard<std::mutex> errorLock(g_loadStatus.errorMutex);
+				std::lock_guard<std::mutex> callbackLock(g_loadStatus.callbackMutex);
+
+				errorMessage = g_loadStatus.errorMessage;
+				failureCallback = g_loadStatus.failureCallback;
+			}
+
+			// Call the failure callback if it exists
+			if (failureCallback)
+			{
+				failureCallback(errorMessage.c_str());
+			}
+
+			// Reset state to idle
+			g_loadStatus.state = LoadingState::Idle;
+		}
+	}
+
+} // namespace KZ::replaysystem::data

@@ -1,0 +1,5 @@
+build*/
+mbedtls-generated*/
+.vs/
+.vscode/
+.cache/

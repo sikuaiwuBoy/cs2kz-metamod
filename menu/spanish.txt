@@ -1,0 +1,170 @@
+// CS2KZ Menu (Spanish)
+// English radio menu support addon for CS2KZ plugin.
+"RadioPanel.txt"
+{
+	"Groups"
+	{
+		"menu_simple"
+		{
+			"hotkey"	"0"
+			"title"		"TP Menú (Simple)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"Checkpoint"
+					"cmd"		"radio; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"Teletransportar"
+					"cmd"		"radio; say /tp"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"3"
+					"label"		"Pausar/Reanudar"
+					"cmd"		"radio; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"4"
+					"label"		"Reiniciar/Respawn"
+					"cmd"		"radio; say /r"
+				}
+			}
+		}
+
+		"menu_advanced"
+		{
+			"hotkey"	"1"
+			"title"		"TP Menú (Avanzado)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"Checkpoint"
+					"cmd"		"radio1; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"Teletransporte"
+					"cmd"		"radio1; say /tp"
+				}
+
+				"Prev Checkpoint"
+				{
+					"hotkey"	"3"
+					"label"		"CP anterior"
+					"cmd"		"radio1; say /prevcp"
+				}
+
+				"Next Checkpoint"
+				{
+					"hotkey"	"4"
+					"label"		"CP siguiente"
+					"cmd"		"radio1; say /nextcp"
+				}
+
+				"Undo Teleport"
+				{
+					"hotkey"	"5"
+					"label"		"Deshacer TP"
+					"cmd"		"radio1; say /undo"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"6"
+					"label"		"Pausar/Reanudar"
+					"cmd"		"radio1; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"7"
+					"label"		"Reiniciar/Respawn"
+					"cmd"		"radio1; say /r"
+				}
+
+				"Noclip"
+				{
+					"hotkey"	"8"
+					"label"		"Alternar Noclip"
+					"cmd"		"radio1; say /noclip"
+				}
+			}
+		}
+
+		"menu_option"
+		{
+			"hotkey"	"2"
+			"title"		"Menú ajustes"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Set Custom Start Position"
+				{
+					"hotkey"	"1"
+					"label"		"Establecer inicio customizado"
+					"cmd"		"say /ssp"
+				}
+
+				"Clear Custom Start Position"
+				{
+					"hotkey"	"2"
+					"label"		"Borrar inicio customizado"
+					"cmd"		"say /csp"
+				}
+
+				"Hide"
+				{
+					"hotkey"	"3"
+					"label"		"Mostrar/esconder otros jugadores"
+					"cmd"		"say /hide"
+				}
+
+				"Hide Weapon"
+				{
+					"hotkey"	"4"
+					"label"		"Mostrar/esconder arma"
+					"cmd"		"say /hideweapon"
+				}
+
+				"Hide Legs"
+				{
+					"hotkey"	"5"
+					"label"		"Mostrar/escsonder piernas"
+					"cmd"		"say /hidelegs"
+				}
+
+				"Toggle Jumpstats"
+				{
+					"hotkey"	"6"
+					"label"		"Activar/desactivar mostrar estadísticas de salto"
+					"cmd"		"say /js"
+				}
+
+				"Toggle Jumpstats Always"
+				{
+					"hotkey"	"7"
+					"label"		"Activar/desactivar mostrar siempre estadísticas de salto"
+					"cmd"		"say /jsalways"
+				}
+			}
+		}
+	}
+}

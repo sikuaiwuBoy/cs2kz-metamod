@@ -1,0 +1,442 @@
+#include "kz/kz.h"
+#include "cs2kz.h"
+#include "kz_hud.h"
+#include "sdk/datatypes.h"
+#include "utils/utils.h"
+#include "utils/simplecmds.h"
+
+#include "kz/option/kz_option.h"
+#include "kz/hud/layout/layout.h"
+#include "kz/timer/kz_timer.h"
+#include "kz/checkpoint/kz_checkpoint.h"
+#include "kz/spec/kz_spec.h"
+#include "kz/language/kz_language.h"
+#include "kz/replays/kz_replaysystem.h"
+#include "sdk/entity/ccscustomhudlayout.h"
+#include "sdk/usercmd.h"
+
+#include <vendor/MultiAddonManager/public/imultiaddonmanager.h>
+extern IMultiAddonManager *g_pMultiAddonManager;
+
+#include "tier0/memdbgon.h"
+
+static_global bool layoutAssetMounted = false;
+
+static_global class KZTimerServiceEventListener_HUD : public KZTimerServiceEventListener
+{
+	virtual void OnTimerStopped(KZPlayer *player, u32 courseGUID) override;
+	virtual void OnTimerEndPost(KZPlayer *player, u32 courseGUID, f32 time, u32 teleportsUsed) override;
+} timerEventListener;
+
+static_global class KZOptionServiceEventListener_HUD : public KZOptionServiceEventListener
+{
+	virtual void OnPlayerPreferencesLoaded(KZPlayer *player)
+	{
+		player->hudService->InvalidatePrefs();
+		player->hudService->ResetShowPanel();
+	}
+
+	virtual void OnPlayerPreferenceChanged(KZPlayer *player, const char *optionName)
+	{
+		player->hudService->InvalidatePrefs();
+		// Cached outside MHUDPrefs, so a reset or an import has to refresh it here.
+		if (KZ_STREQI(optionName, "showPanel"))
+		{
+			player->hudService->ResetShowPanel();
+		}
+	}
+} optionEventListener;
+
+void KZHUDService::Init()
+{
+	KZTimerService::RegisterEventListener(&timerEventListener);
+	KZOptionService::RegisterEventListener(&optionEventListener);
+	KZHUDService::RegisterMenu();
+	KZHUDService::RefreshLayoutAvailability();
+}
+
+void KZHUDService::RefreshLayoutAvailability()
+{
+	layoutAssetMounted = g_pFullFileSystem && g_pFullFileSystem->FileExists(KZ_MHUD_LAYOUT, NULL);
+}
+
+bool KZHUDService::IsLayoutHudAvailable()
+{
+	return g_pMultiAddonManager != nullptr || layoutAssetMounted;
+}
+
+void KZHUDService::OnProcessMovementPost()
+{
+	if (this->player->GetPlayerPawn()->m_fFlags() & FL_ONGROUND)
+	{
+		fromDuckbug = false;
+	}
+	if (this->player->GetMoveType() == MOVETYPE_LADDER)
+	{
+		fromDuckbug = false;
+		crouchJumping = false;
+	}
+}
+
+void KZHUDService::Reset()
+{
+	this->AbortHudEdit();
+	this->showPanel = this->player->optionService->GetPreferenceBool("showPanel", true);
+	this->timerStoppedTime = {};
+	this->currentTimeWhenTimerStopped = {};
+	this->jumpedThisTick = false;
+	this->jumpInputCount = 0;
+	this->jumpInputExpireTime = 0;
+	this->fromDuckbug = false;
+	this->crouchJumping = false;
+}
+
+void KZHUDService::OnSetupMove(CUserCmd *cmd)
+{
+	i32 presses = 0;
+	if (cmd->base().subtick_moves_size() == 0)
+	{
+		presses = cmd->buttonstates.IsButtonNewlyPressed(IN_JUMP) ? 1 : 0;
+	}
+	for (i32 i = 0; i < cmd->base().subtick_moves_size(); i++)
+	{
+		const CSubtickMoveStep &step = cmd->base().subtick_moves(i);
+		if (step.button() == IN_JUMP && step.pressed())
+		{
+			presses++;
+		}
+	}
+	if (presses == 0)
+	{
+		return;
+	}
+	const f64 now = this->player->GetCurtime();
+	if (now >= this->jumpInputExpireTime)
+	{
+		this->jumpInputCount = 0;
+	}
+	this->jumpInputCount += presses;
+	this->jumpInputExpireTime = now + MHUD_KEYS_JUMP_COUNT_HOLD;
+}
+
+i32 KZHUDService::GetJumpInputCount() const
+{
+	return this->player->GetCurtime() < this->jumpInputExpireTime ? this->jumpInputCount : 0;
+}
+
+KZHUDService::SpeedInfo KZHUDService::GetSpeedInfo(const MHUDPrefs &prefs)
+{
+	SpeedInfo info {};
+	CCSPlayerPawn *pawn = this->player->GetPlayerPawn();
+	// A spectator in free camera sees the camera's speed, even while their own pawn persists.
+	if (!pawn || this->player->specService->IsObserving())
+	{
+		CCSPlayerPawnBase *observer = this->player->GetObserverPawn();
+		if (observer)
+		{
+			info.speed = observer->m_vecAbsVelocity().Length2D();
+		}
+		return info;
+	}
+	Vector velocity, baseVelocity;
+	this->player->GetVelocity(&velocity);
+	this->player->GetBaseVelocity(&baseVelocity);
+	velocity += baseVelocity;
+	info.speed = velocity.Length2D();
+	// CategorizePosition sets this when it finds no ground while rising at up to NON_JUMP_VELOCITY.
+	info.deadstrafe =
+		!(pawn->m_fFlags & FL_ONGROUND) && pawn->m_MoveType == MOVETYPE_WALK && this->player->GetMoveServices()->m_flSurfaceFriction() == 0.25f;
+	// Keep the takeoff velocity on for a while after landing so the speed values flicker less.
+	// mhudPrespeedShow == Always skips this timeout, so the last takeoff speed keeps showing while grounded.
+	const bool pastGraceWindow =
+		this->player->GetPlayerPawn()->m_fFlags & FL_ONGROUND && this->player->GetCurtime() - this->player->landingTime > KZ_HUD_ON_GROUND_THRESHOLD;
+	if ((pastGraceWindow && prefs.prespeedShow != MHUDPrespeedShow::Always)
+		|| (this->player->GetPlayerPawn()->m_MoveType == MOVETYPE_LADDER && !player->IsButtonPressed(IN_JUMP)))
+	{
+		return info;
+	}
+	info.showTakeoff = true;
+	// Always mode holds showTakeoff on while grounded; indicators must still stop at the landing grace.
+	info.recentTakeoff = !pastGraceWindow;
+	info.takeoffSpeed = this->player->takeoffVelocity.Length2D();
+	info.crouchJump = this->crouchJumping;
+	info.walkedOff = !this->player->jumped && !this->player->takeoffFromLadder;
+	if (this->player->IsPerfing() && !this->player->possibleLadderHop && !this->player->takeoffFromLadder)
+	{
+		info.jumpbug = this->fromDuckbug;
+		info.perf = !this->fromDuckbug;
+	}
+	return info;
+}
+
+CPlayer_MovementServices *KZHUDService::GetHudMoveServices()
+{
+	CCSPlayerPawn *pawn = this->player->GetPlayerPawn();
+	if (pawn && !this->player->specService->IsObserving())
+	{
+		return this->player->GetMoveServices();
+	}
+	// Dead or spectating, the keys are the observer camera's.
+	CCSPlayerPawnBase *observer = this->player->GetObserverPawn();
+	return observer ? observer->m_pMovementServices() : nullptr;
+}
+
+std::string KZHUDService::GetTimerText(const char *language, bool showState)
+{
+	if (KZ::replaysystem::IsReplayBot(this->player))
+	{
+		char timeText[128];
+
+		f64 time = KZ::replaysystem::GetTime();
+		bool paused = KZ::replaysystem::GetPaused();
+		bool timerRunning = KZ::replaysystem::GetEndTime() == 0.0f;
+		// Show timer if time is not 0 or end time is not 0.
+		if (time == 0.0f && KZ::replaysystem::GetEndTime() == 0.0f)
+		{
+			return std::string("");
+		}
+		if (!timerRunning)
+		{
+			time = KZ::replaysystem::GetEndTime();
+		}
+		utils::FormatTime(time, timeText, sizeof(timeText));
+		// clang-format off
+		return KZLanguageService::PrepareMessageWithLang(language, "HUD - Timer Text",
+			timeText,
+			timerRunning || !showState ? "" : KZLanguageService::PrepareMessageWithLang(language, "HUD - Stopped Text").c_str(),
+			paused && showState ? KZLanguageService::PrepareMessageWithLang(language, "HUD - Paused Text").c_str() : ""
+		);
+		// clang-format on
+	}
+	if (this->player->timerService->GetTimerRunning() || this->ShouldShowTimerAfterStop())
+	{
+		char timeText[128];
+
+		// clang-format off
+		f64 time = this->player->timerService->GetTimerRunning()
+				? player->timerService->GetTime()
+				: this->currentTimeWhenTimerStopped;
+		bool timerRunning = this->player->timerService->GetTimerRunning();
+		bool paused = this->player->timerService->GetPaused();
+
+		utils::FormatTime(time, timeText, sizeof(timeText));
+		return KZLanguageService::PrepareMessageWithLang(language, "HUD - Timer Text",
+			timeText,
+			timerRunning || !showState ? "" : KZLanguageService::PrepareMessageWithLang(language, "HUD - Stopped Text").c_str(),
+			paused && showState ? KZLanguageService::PrepareMessageWithLang(language, "HUD - Paused Text").c_str() : ""
+		);
+		// clang-format on
+	}
+	return std::string("");
+}
+
+std::string KZHUDService::GetCheckpointText(const char *language)
+{
+	// clang-format off
+	return KZLanguageService::PrepareMessageWithLang(language, "HUD - Checkpoint Text",
+		KZ::replaysystem::IsReplayBot(this->player) ? KZ::replaysystem::GetCurrentCpIndex() : this->player->checkpointService->GetCurrentCpIndex(),
+		KZ::replaysystem::IsReplayBot(this->player) ? KZ::replaysystem::GetCheckpointCount() : this->player->checkpointService->GetCheckpointCount(),
+		KZ::replaysystem::IsReplayBot(this->player) ? KZ::replaysystem::GetTeleportCount() : this->player->checkpointService->GetTeleportCount()
+	);
+	// clang-format on
+}
+
+void KZHUDService::DrawPanels(KZPlayer *player, KZPlayer *target)
+{
+	if (target->IsFakeClient())
+	{
+		return;
+	}
+	target->hudService->UpdateHudLayout(player);
+	target->hudService->UpdateGameHud();
+
+	KZHUDService::DrawLegacyPanels(player, target);
+}
+
+void KZHUDService::UpdateGameHud()
+{
+	CBasePlayerPawn *pawn = this->player->GetPlayerPawn();
+	if (this->gameHudPawn.Get() != pawn)
+	{
+		this->RestoreGameHud();
+		this->gameHudPawn = pawn;
+	}
+	if (!pawn)
+	{
+		return;
+	}
+	const u32 wanted = this->GetOwnPrefs().hiddenGameHud;
+	const u32 current = pawn->m_iHideHUD();
+	const u32 desired = (current & ~this->gameHudBits) | wanted;
+	this->gameHudBits = wanted;
+	if (desired != current)
+	{
+		pawn->m_iHideHUD(desired);
+	}
+}
+
+void KZHUDService::RestoreGameHud()
+{
+	// Null on server exit.
+	CBasePlayerPawn *pawn = GameEntitySystem() ? this->gameHudPawn.Get() : nullptr;
+	if (pawn && (pawn->m_iHideHUD() & this->gameHudBits))
+	{
+		pawn->m_iHideHUD(pawn->m_iHideHUD() & ~this->gameHudBits);
+	}
+	this->gameHudBits = 0;
+}
+
+void KZHUDService::ResetShowPanel()
+{
+	this->showPanel = this->player->optionService->GetPreferenceBool("showPanel", true);
+}
+
+void KZHUDService::TogglePanel()
+{
+	this->showPanel = !this->showPanel;
+	this->player->optionService->SetPreferenceBool("showPanel", this->showPanel);
+	if (!this->showPanel)
+	{
+		utils::PrintAlert(this->player->GetController(), "#SFUI_EmptyString");
+		utils::PrintCentre(this->player->GetController(), "#SFUI_EmptyString");
+		this->player->languageService->PrintHTMLCentre(false, false, "HUD - HTML Panel Disabled");
+	}
+}
+
+void KZHUDService::OnTimerStopped(f64 currentTimeWhenTimerStopped)
+{
+	// g_pKZUtils->GetServerGlobals() becomes invalid when the plugin is unloading.
+	if (g_KZPlugin.unloading)
+	{
+		return;
+	}
+	this->timerStoppedTime = g_pKZUtils->GetServerGlobals()->curtime;
+	this->currentTimeWhenTimerStopped = currentTimeWhenTimerStopped;
+}
+
+void KZTimerServiceEventListener_HUD::OnTimerStopped(KZPlayer *player, u32 courseGUID)
+{
+	player->hudService->OnTimerStopped(player->timerService->GetTime());
+}
+
+void KZTimerServiceEventListener_HUD::OnTimerEndPost(KZPlayer *player, u32 courseGUID, f32 time, u32 teleportsUsed)
+{
+	player->hudService->OnTimerStopped(time);
+}
+
+bool KZHUDService::IsCompactPanel()
+{
+	return this->GetPrefs().compactPanel;
+}
+
+void KZHUDService::ToggleCompactPanel()
+{
+	this->player->optionService->SetPreferenceBool("compactPanel", !this->IsCompactPanel());
+}
+
+SCMD(kz_hudedit, SCFL_HUD)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	if (player->hudService->IsEditingHud())
+	{
+		player->hudService->StopHudEdit();
+	}
+	else
+	{
+		player->hudService->StartHudEdit();
+	}
+	return true;
+}
+
+SCMD(kz_hidehud, SCFL_HUD)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	// Without arguments, everything the command can toggle except the crosshair.
+	u32 bits = 0;
+	if (args->ArgC() < 2)
+	{
+		for (const GameHudPartDef &part : GAME_HUD_PARTS)
+		{
+			if (part.argName && part.bit != KZ_HIDEHUD_CROSSHAIR)
+			{
+				bits |= part.bit;
+			}
+		}
+	}
+	for (i32 i = 1; i < args->ArgC(); i++)
+	{
+		const GameHudPartDef *found = nullptr;
+		for (const GameHudPartDef &part : GAME_HUD_PARTS)
+		{
+			if (part.argName && KZ_STREQI(args->Arg(i), part.argName))
+			{
+				found = &part;
+				break;
+			}
+		}
+		if (!found)
+		{
+			player->languageService->PrintChat(true, false, "HideHUD Command Usage");
+			return true;
+		}
+		bits |= found->bit;
+	}
+
+	// Hide them all unless every one is already hidden.
+	bool hide = false;
+	for (const GameHudPartDef &part : GAME_HUD_PARTS)
+	{
+		if ((part.bit & bits) && !player->optionService->GetPreferenceBool(part.prefKey, false))
+		{
+			hide = true;
+			break;
+		}
+	}
+	std::string names;
+	for (const GameHudPartDef &part : GAME_HUD_PARTS)
+	{
+		if (part.bit & bits)
+		{
+			player->optionService->SetPreferenceBool(part.prefKey, hide);
+			names += names.empty() ? part.argName : std::string(", ") + part.argName;
+		}
+	}
+	player->languageService->PrintChat(true, false, hide ? "HUD Option - Hide HUD - Enable" : "HUD Option - Hide HUD - Disable", names.c_str());
+	return true;
+}
+
+SCMD(kz_panel, SCFL_HUD)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	if (args->ArgC() >= 2)
+	{
+		if (KZ_STREQI(args->Arg(1), "compact"))
+		{
+			player->hudService->ToggleCompactPanel();
+			if (player->hudService->IsCompactPanel())
+			{
+				player->languageService->PrintChat(true, false, "HUD Option - Compact Panel - Enable");
+			}
+			else
+			{
+				player->languageService->PrintChat(true, false, "HUD Option - Compact Panel - Disable");
+			}
+			return true;
+		}
+		else
+		{
+			player->languageService->PrintChat(true, false, "Panel Command Usage");
+			return true;
+		}
+	}
+	player->hudService->TogglePanel();
+	if (player->hudService->IsShowingPanel())
+	{
+		player->languageService->PrintChat(true, false, "HUD Option - Info Panel - Enable");
+	}
+	else
+	{
+		player->languageService->PrintChat(true, false, "HUD Option - Info Panel - Disable");
+	}
+	return true;
+}

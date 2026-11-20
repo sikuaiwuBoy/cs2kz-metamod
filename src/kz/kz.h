@@ -1,0 +1,326 @@
+#pragma once
+
+#include "common.h"
+#include "movement/movement.h"
+#include "sdk/datatypes.h"
+#include "mappingapi/kz_mappingapi.h"
+#include "circularbuffer.h"
+
+enum KzModeCvars : int; // defined in mode/kz_mode.h
+// TODO: If we want to enable player collision, we need to unhardcode this.
+#define KZ_COLLISION_GROUP_STANDARD  COLLISION_GROUP_DEBRIS
+#define KZ_COLLISION_GROUP_NOTRIGGER LAST_SHARED_COLLISION_GROUP
+
+#define KZ_SND_SET_CP    "UIPanorama.round_report_odds_none"
+#define KZ_SND_DO_TP     "UIPanorama.round_report_odds_none"
+#define KZ_SND_RESET_CPS "UIPanorama.round_report_odds_dn"
+
+#define KZ_WORKSHOP_ADDON_ID            "3469155349"
+#define KZ_WORKSHOP_ADDON_SNDEVENT_FILE "soundevents/soundevents_cs2kz.vsndevts"
+
+#define KZ_DEFAULT_CHAT_PREFIX  "{lime}KZ {grey}|{default}"
+#define KZ_DEFAULT_TIP_INTERVAL 75.0
+#define KZ_DEFAULT_LANGUAGE     "en"
+#define KZ_DEFAULT_STYLE        "Normal"
+#define KZ_DEFAULT_MODE         "Classic"
+#define KZ_BASE_ADDON_KEY       "default"
+
+#define KZ_RECENT_TELEPORT_THRESHOLD 0.05f
+
+class KZPlayer;
+class KZAnticheatService;
+class KZAwayService;
+class KZBeamService;
+class KZCheckpointService;
+class KZDatabaseService;
+class KZGlobalService;
+class KZGlobalService;
+class KZHUDService;
+class KZJumpstatsService;
+class KZLanguageService;
+class KZMapService;
+class KZMeasureService;
+class KZMenuService;
+class KZModeService;
+class KZNoclipService;
+class KZOptionService;
+class KZPaintService;
+class KZProgressService;
+class KZQuietService;
+class KZRacingService;
+class KZSpecService;
+class KZGotoService;
+class KZProfileService;
+class KZStyleService;
+class KZTelemetryService;
+class KZTimerService;
+class KZTipService;
+class KZTriggerService;
+class KZUIService;
+class KZPistolService;
+class KZRecordingService;
+class KZFOVService;
+class KZZtopwatchService;
+
+class KZPlayer : public MovementPlayer
+{
+public:
+	KZPlayer(i32 i) : MovementPlayer(i)
+	{
+		this->Init();
+	}
+
+	~KZPlayer() override
+	{
+		this->DestroyServices();
+	}
+
+	// General events
+	virtual void Init() override;
+	virtual void Reset() override;
+	virtual void OnPlayerConnect(u64 steamID64) override;
+	virtual void OnPlayerActive() override;
+	virtual void OnPlayerFullyConnect() override;
+	virtual void OnAuthorized() override;
+	virtual void OnPrimeStatusConfirmed() override;
+	virtual bool IsAway() override;
+	// Tears down what belongs to the player being on the server, once they are gone for good.
+	void CleanupPlayer();
+	void CleanupClient();
+
+	virtual void OnPhysicsSimulate() override;
+	virtual void OnPhysicsSimulatePost() override;
+	// Returns false when the command must not run.
+	bool OnPlayerRunCommand(CUserCmd *cmd);
+	virtual void OnProcessUsercmds(CUserCmd *, int) override;
+	virtual void OnProcessUsercmdsPost(CUserCmd *, int) override;
+	virtual void OnSetupMove(CUserCmd *) override;
+	virtual void OnSetupMovePost(CUserCmd *) override;
+	virtual void OnProcessMovement() override;
+	virtual void OnProcessMovementPost() override;
+	virtual void OnPlayerMove() override;
+	virtual void OnPlayerMovePost() override;
+	virtual void OnCheckParameters() override;
+	virtual void OnCheckParametersPost() override;
+	virtual void OnCanMove() override;
+	virtual void OnCanMovePost() override;
+	virtual void OnFullWalkMove(bool &) override;
+	virtual void OnFullWalkMovePost(bool) override;
+	virtual void OnMoveInit() override;
+	virtual void OnMoveInitPost() override;
+	virtual void OnCheckWater() override;
+	virtual void OnCheckWaterPost() override;
+	virtual void OnWaterMove() override;
+	virtual void OnWaterMovePost() override;
+	virtual void OnCheckVelocity(const char *) override;
+	virtual void OnCheckVelocityPost(const char *) override;
+	virtual void OnDuck() override;
+	virtual void OnDuckPost() override;
+	virtual void OnCanUnduck() override;
+	// Make an exception for this as it is the only time where we need to change the return value.
+	virtual void OnCanUnduckPost(bool &) override;
+	virtual void OnLadderMove() override;
+	virtual void OnLadderMovePost() override;
+	virtual void OnCheckJumpButtonLegacy() override;
+	virtual void OnCheckJumpButtonLegacyPost() override;
+	virtual void OnCheckJumpButtonModern() override;
+	virtual void OnCheckJumpButtonModernPost() override;
+	virtual void OnJumpLegacy() override;
+	virtual void OnJumpLegacyPost() override;
+	virtual void OnJumpModern() override;
+	virtual void OnJumpModernPost() override;
+	virtual void OnAirMove() override;
+	virtual void OnAirMovePost() override;
+	virtual void OnAirAccelerate(Vector &wishdir, f32 &wishspeed, f32 &accel) override;
+	virtual void OnAirAcceleratePost(Vector wishdir, f32 wishspeed, f32 accel) override;
+	virtual void OnFriction() override;
+	virtual void OnFrictionPost() override;
+	virtual void OnWalkMove() override;
+	virtual void OnWalkMovePost() override;
+	virtual void OnTryPlayerMove(Vector *, trace_t *, bool *) override;
+	virtual void OnTryPlayerMovePost(Vector *, trace_t *, bool *) override;
+	virtual void OnCategorizePosition(bool) override;
+	virtual void OnCategorizePositionPost(bool) override;
+	virtual void OnFinishGravity() override;
+	virtual void OnFinishGravityPost() override;
+	virtual void OnCheckFalling() override;
+	virtual void OnCheckFallingPost() override;
+	virtual void OnPostPlayerMove() override;
+	virtual void OnPostPlayerMovePost() override;
+	virtual void OnPostThink() override;
+	virtual void OnPostThinkPost() override;
+
+	// Movement events
+	virtual void OnStartTouchGround() override;
+	virtual void OnStopTouchGround() override;
+	virtual void OnChangeMoveType(MoveType_t oldMoveType) override;
+
+	// Other events
+	virtual void OnChangeTeamPost(i32 team) override;
+	virtual void OnTeleport(const Vector *origin, const QAngle *angles, const Vector *velocity) override;
+	virtual void OnTeleportBegin(const Vector *origin, const QAngle *angles, const Vector *velocity) override;
+	virtual void OnTeleportEnd() override;
+
+	void PlayErrorSound();
+
+private:
+	f64 lastTeleportTime {};
+	f32 lastValidYaw {};
+	// 1 for left, -1 for right, 0 for none.
+	i32 lastTurnbindDirection {};
+	// Left first, then right.
+	f32 turnbindStartTimes[2] {-FLT_MAX, -FLT_MAX};
+
+	// Deletes and nulls every service this player owns.
+	void DestroyServices();
+
+	// The per-tick logic around a command.
+	// A replay bot can run this zero or several times in one server tick.
+	void SimulateTick();
+	void SimulateTickPost();
+
+public:
+	KZAnticheatService *anticheatService {};
+	KZAwayService *awayService {};
+	KZBeamService *beamService {};
+	KZCheckpointService *checkpointService {};
+	KZDatabaseService *databaseService {};
+	KZGlobalService *globalService {};
+	KZHUDService *hudService {};
+	KZJumpstatsService *jumpstatsService {};
+	KZLanguageService *languageService {};
+	KZMeasureService *measureService {};
+	KZMenuService *menuService {};
+	KZModeService *modeService {};
+	KZNoclipService *noclipService {};
+	KZOptionService *optionService {};
+	KZPaintService *paintService {};
+	KZProgressService *progressService {};
+	KZQuietService *quietService {};
+	KZRacingService *racingService {};
+	KZSpecService *specService {};
+	KZGotoService *gotoService {};
+	KZProfileService *profileService {};
+	std::vector<KZStyleService *> styleServices {};
+	KZTelemetryService *telemetryService {};
+	KZTimerService *timerService {};
+	KZTipService *tipService {};
+	KZTriggerService *triggerService {};
+	KZUIService *uiService {};
+	KZPistolService *pistolService {};
+	KZRecordingService *recordingService {};
+	KZFOVService *fovService {};
+	KZZtopwatchService *ztopwatchService {};
+
+	// Timestamp (curtime) of the last accepted scmd command, used for the per-command cooldown.
+	f32 lastCommandTime {};
+
+	void LimitTurnbinds();
+	void EnableGodMode();
+
+	// Leg stuff
+	void ToggleHideLegs();
+
+	void UpdatePlayerModelAlpha();
+	// Teleport checking, used for multiple services
+	virtual bool JustTeleported(f32 threshold = KZ_RECENT_TELEPORT_THRESHOLD);
+	// Triggerfix stuff
+
+	// Hit all triggers from start to end with the specified bounds,
+	// and call Touch/StartTouch on triggers that the player is touching.
+	virtual void TouchTriggersAlongPath(const Vector &start, const Vector &end, const bbox_t &bounds);
+
+	// Update the list of triggers that the player is touching, and call StartTouch/EndTouch appropriately.
+	virtual void UpdateTriggerTouchList();
+
+	// Print helpers
+	virtual void PrintConsole(bool addPrefix, bool includeSpectators, const char *format, ...);
+	virtual void PrintChat(bool addPrefix, bool includeSpectators, const char *format, ...); // Already supports colors.
+	virtual void PrintCentre(bool addPrefix, bool includeSpectators, const char *format, ...);
+	virtual void PrintAlert(bool addPrefix, bool includeSpectators, const char *format, ...);
+	virtual void PrintHTMLCentre(bool addPrefix, bool includeSpectators, const char *format, ...);
+
+	const CVValue_t *GetCvarValueFromModeStyles(KzModeCvars cvar);
+};
+
+class KZBaseService
+{
+public:
+	KZPlayer *player;
+
+	KZBaseService(KZPlayer *player)
+	{
+		this->player = player;
+	}
+
+	// Services are routinely deleted through KZBaseService/KZModeService/KZStyleService pointers
+	// (mode switching, style toggling, player teardown), so this has to be virtual.
+	virtual ~KZBaseService() = default;
+
+	// To be implemented by each service class
+	virtual void Reset() {}
+};
+
+class KZPlayerManager : public MovementPlayerManager
+{
+public:
+	KZPlayerManager()
+	{
+		for (i32 i = 0; i < MAX_PLAYERS; i++)
+		{
+			delete players[i];
+			players[i] = new KZPlayer(i + 1);
+		}
+	}
+
+public:
+	KZPlayer *ToPlayer(CPlayerPawnComponent *component);
+	KZPlayer *ToPlayer(CBasePlayerController *controller);
+	KZPlayer *ToPlayer(CBasePlayerPawn *pawn);
+	KZPlayer *ToPlayer(CPlayerSlot slot);
+	KZPlayer *ToPlayer(CEntityIndex entIndex);
+	KZPlayer *ToPlayer(CPlayerUserId userID);
+	KZPlayer *SteamIdToPlayer(u64 steamID, bool validated = true);
+	KZPlayer *SessionToPlayer(u32 sessionID);
+
+	PlayerSlotRange<KZPlayer> GetAllSlots()
+	{
+		return PlayerSlotRange<KZPlayer>(players, false);
+	}
+
+	PlayerSlotRange<KZPlayer> GetInGamePlayers()
+	{
+		return PlayerSlotRange<KZPlayer>(players, true);
+	}
+
+	KZPlayer *ToKZPlayer(MovementPlayer *player)
+	{
+		return static_cast<KZPlayer *>(player);
+	}
+
+	KZPlayer *ToKZPlayer(Player *player)
+	{
+		return static_cast<KZPlayer *>(player);
+	}
+};
+
+extern KZPlayerManager *g_pKZPlayerManager;
+
+namespace KZ
+{
+	namespace misc
+	{
+		void Init();
+		void RegisterMenu();
+		void OnActivateServer();
+		void JoinTeam(KZPlayer *player, int newTeam, bool restorePos = true);
+		void ProcessConCommand(ConCommandRef cmd, const CCommandContext &ctx, const CCommand &args);
+		bool CheckBlockedRadioCommands(const char *cmd);
+		void OnRoundStart();
+		void InitTimeLimit();
+		void EnforceTimeLimit();
+		void UnrestrictTimeLimit();
+		void OnPhysicsGameSystemFrameBoundary(void *pThis);
+		void HandleTeleportToCourse(KZPlayer *player, const CCommand *args);
+	} // namespace misc
+}; // namespace KZ

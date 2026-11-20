@@ -1,0 +1,26 @@
+#pragma once
+
+#include "sdk/datatypes.h"
+#include "kz_replay.h"
+
+class CCSPlayerController;
+class KZPlayer;
+
+namespace KZ::replaysystem::bot
+{
+	// Bot lifecycle management
+	void SpawnBot();
+	void KickBot();
+	void MakeBotAlive();
+
+	// Bot state management
+	CCSPlayerController *GetBot();
+	bool IsValidBot(CCSPlayerController *controller);
+	KZPlayer *GetBotPlayer();
+
+	// Bot setup and configuration
+	void InitializeBotForReplay(const ReplayHeader &header);
+
+	// Bot spectator handling
+	void SpectateBot(KZPlayer *spectator);
+} // namespace KZ::replaysystem::bot

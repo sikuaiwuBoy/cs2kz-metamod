@@ -1,0 +1,1012 @@
+#include <string_view>
+
+#include "kz/kz.h"
+#include "kz/mode/kz_mode.h"
+#include "kz/option/kz_option.h"
+#include "kz/timer/kz_timer.h"
+#include "utils/json.h"
+
+#include "kz_global.h"
+#include "messages.h"
+
+bool KZGlobalService::GetApiHttpUrl(std::string &url)
+{
+	url = KZOptionService::GetOptionStr("apiUrl", "https://api.cs2kz.org");
+
+	if (url.empty())
+	{
+		KZ_LOG_INFO(LogChannel::Global, "`apiUrl` is empty. GlobalService will be disabled.\n");
+		return false;
+	}
+
+	if (url.size() < 4 || url.substr(0, 4) != "http")
+	{
+		KZ_LOG_INFO(LogChannel::Global, "`apiUrl` is invalid. GlobalService will be disabled.\n");
+		return false;
+	}
+
+	if (url.back() != '/')
+	{
+		url += "/";
+	}
+
+	return true;
+}
+
+static_function bool GetApiUrl(std::string &url)
+{
+	if (!KZGlobalService::GetApiHttpUrl(url))
+	{
+		return false;
+	}
+
+	url.replace(0, 4, "ws");
+	url += "auth/cs2";
+
+	return true;
+}
+
+static_function void RegisterGlobalCourseIDs(const KZ::api::Map &mapInfo)
+{
+	for (const auto &course : mapInfo.courses)
+	{
+		KZ::course::UpdateCourseGlobalID(course.name.c_str(), course.id);
+		KZ_LOG_INFO(LogChannel::Global, "Registered course '%s' with ID %i!\n", course.name.c_str(), course.id);
+	}
+}
+
+static_function bool GetApiKey(std::string &key)
+{
+	key = KZOptionService::GetOptionStr("apiKey");
+
+	if (key.empty())
+	{
+		KZ_LOG_INFO(LogChannel::Global, "`apiKey` is empty. GlobalService will be disabled.\n");
+		return false;
+	}
+
+	return true;
+}
+
+void KZGlobalService::Init()
+{
+	if (KZGlobalService::state.load() != KZGlobalService::State::Uninitialized)
+	{
+		return;
+	}
+
+	KZ_LOG_INFO(LogChannel::Global, "Initializing GlobalService...\n");
+
+	std::string apiUrl;
+	if (!GetApiUrl(apiUrl))
+	{
+		KZGlobalService::state.store(KZGlobalService::State::Disconnected);
+		return;
+	}
+	KZ_LOG_INFO(LogChannel::Global, "API URL is `%s`.\n", apiUrl.c_str());
+
+	std::string apiKey;
+	if (!GetApiKey(apiKey))
+	{
+		KZGlobalService::state.store(KZGlobalService::State::Disconnected);
+		return;
+	}
+
+	KZGlobalService::EnforceConVars();
+
+	KZGlobalService::WS::socket = std::make_unique<ix::WebSocket>();
+	KZGlobalService::WS::socket->setUrl(apiUrl);
+	KZGlobalService::WS::socket->setExtraHeaders({{"Authorization", std::string("Bearer ") + apiKey}});
+	KZGlobalService::WS::socket->setOnMessageCallback(KZGlobalService::WS::OnMessage);
+	KZGlobalService::WS::socket->setPingInterval(15);
+
+	KZGlobalService::state.store(KZGlobalService::State::Configured);
+}
+
+void KZGlobalService::Cleanup()
+{
+	if (KZGlobalService::WS::socket)
+	{
+		KZGlobalService::WS::socket->stop();
+		KZGlobalService::state.store(KZGlobalService::State::Disconnected);
+		KZGlobalService::WS::socket.reset(nullptr);
+	}
+
+	KZGlobalService::state.store(KZGlobalService::State::Uninitialized);
+	KZGlobalService::RestoreConVars();
+}
+
+void KZGlobalService::ReloadConfig()
+{
+	std::string apiUrl;
+	std::string apiKey;
+
+	if (!GetApiUrl(apiUrl) || !GetApiKey(apiKey))
+	{
+		// `GetApiUrl()` / `GetApiKey()` already logged the reason.
+		KZGlobalService::Cleanup();
+		KZGlobalService::state.store(KZGlobalService::State::Disconnected);
+		return;
+	}
+
+	if (!KZGlobalService::WS::socket)
+	{
+		KZGlobalService::Cleanup();
+		KZGlobalService::Init();
+
+		if (KZGlobalService::state.load() != KZGlobalService::State::Configured)
+		{
+			KZ_LOG_WARN(LogChannel::Global, "Failed to initialize GlobalService.\n");
+			return;
+		}
+	}
+	else
+	{
+		KZ_LOG_INFO(LogChannel::Global, "Reconnecting to the API...\n");
+
+		// This is synchronous: it closes the connection, cancels any pending reconnection backoff and joins
+		// the WebSocket thread. `WS::OnCloseMessage()` may still run on the WebSocket thread before this
+		// returns, so we must not hold any of our own mutexes here, nor touch `state` until afterwards.
+		KZGlobalService::WS::socket->stop();
+
+		KZGlobalService::WS::socket->setUrl(apiUrl);
+		KZGlobalService::WS::socket->setExtraHeaders({{"Authorization", std::string("Bearer ") + apiKey}});
+
+		// Reset the automatic reconnection to its initial state
+		KZGlobalService::WS::socket->enableAutomaticReconnection();
+		KZGlobalService::WS::socket->setMinWaitBetweenReconnectionRetries(10'000 /* ms */);
+
+		// `OnCloseMessage()` clears every other queue, but not a `hello_ack` that arrived right before we
+		// disconnected. Completing the new handshake with a stale ack would apply outdated map information.
+		{
+			std::lock_guard _guard(KZGlobalService::callbacks.mutex);
+			KZGlobalService::callbacks.helloAck.reset();
+		}
+	}
+
+	KZGlobalService::state.store(KZGlobalService::State::Connecting);
+	KZGlobalService::WS::socket->start();
+}
+
+void KZGlobalService::UpdateRecordCache()
+{
+	// clang-format off
+	u16 currentMapID = KZGlobalService::WithCurrentMap([](const std::optional<KZ::api::Map> &mapInfo) {
+		return mapInfo ? mapInfo->id : 0;
+	});
+	// clang-format on
+
+	if (currentMapID == 0)
+	{
+		KZ_LOG_INFO(LogChannel::Global, "Current map is not global; not updating record cache\n");
+		return;
+	}
+
+	KZ::api::messages::WantWorldRecordsForCache message {currentMapID};
+	KZGlobalService::MessageCallback<KZ::api::messages::WorldRecordsForCache> callback(KZGlobalService::OnWorldRecordsForCache);
+	KZGlobalService::WS::SendMessage(message, std::move(callback));
+}
+
+void KZGlobalService::OnWorldRecordsForCache(const KZ::api::messages::WorldRecordsForCache &records)
+{
+	for (const KZ::api::Record &record : records.records)
+	{
+		const KZCourseDescriptor *course = KZ::course::GetCourseByGlobalCourseID(record.course.id);
+
+		if (course == nullptr)
+		{
+			KZ_LOG_WARN(LogChannel::Global, "Could not find current course?\n");
+			continue;
+		}
+
+		PluginId modeID = KZ::mode::GetModeInfo(record.mode).id;
+
+		// Never let a slower record overwrite a faster one.
+		const PBData *cached = KZTimerService::GetGlobalCachedRecord(course, modeID);
+
+		if (!cached || cached->overall.pbTime == 0 || record.time < cached->overall.pbTime)
+		{
+			KZTimerService::InsertRecordToCache(record.time, course, modeID, true, true, "", record.player.name.c_str(), record.id.c_str());
+		}
+
+		// Inserting may rehash the cache and invalidate the pointer above.
+		cached = KZTimerService::GetGlobalCachedRecord(course, modeID);
+
+		if (record.teleports == 0 && (!cached || cached->pro.pbTime == 0 || record.time < cached->pro.pbTime))
+		{
+			KZTimerService::InsertRecordToCache(record.time, course, modeID, false, true, "", record.player.name.c_str(), record.id.c_str());
+		}
+	}
+}
+
+void KZGlobalService::SubmitBan(u64 steamID, std::string reason, std::string details)
+{
+	// TODO Anticheat: Implement this!
+}
+
+void KZGlobalService::OnMapInfo(const std::optional<KZ::api::Map> &mapInfo, std::string sentMapName)
+{
+	bool mapOk = false;
+	std::string currentMapName = g_pKZUtils->GetCurrentMapName(&mapOk);
+
+	if (mapOk && currentMapName != sentMapName)
+	{
+		KZ_LOG_INFO(LogChannel::Global, "Map changed since MapChange was sent (sent '%s', current '%s'); re-sending.\n", sentMapName.c_str(),
+					currentMapName.c_str());
+		KZGlobalService::SendMapChange();
+		return;
+	}
+
+	if (mapInfo.has_value())
+	{
+		char md5[33];
+		g_pKZUtils->GetCurrentMapMD5(md5, sizeof(md5));
+		if (mapInfo.has_value() && mapInfo.value().vpkChecksum != md5)
+		{
+			KZ_LOG_WARN(LogChannel::Global, "Checksum mismatch for current map (expected %s, got %s); treating as unapproved.\n", md5,
+						mapInfo.value().vpkChecksum.c_str());
+			mapOk = false;
+		}
+		else if (mapOk)
+		{
+			KZ_LOG_INFO(LogChannel::Global, "%s is approved.\n", mapInfo->name.c_str());
+			RegisterGlobalCourseIDs(*mapInfo);
+		}
+		else
+		{
+			KZ_LOG_INFO(LogChannel::Global, "Failed to get current map name.\n");
+		}
+	}
+	else
+	{
+		KZ_LOG_INFO(LogChannel::Global, "%s is not approved.\n", sentMapName.c_str());
+		mapOk = false;
+	}
+
+	{
+		std::lock_guard _guard(KZGlobalService::currentMap.mutex);
+		KZGlobalService::currentMap.info = mapOk ? std::move(mapInfo) : std::nullopt;
+		KZGlobalService::currentMap.confirmed = true;
+	}
+
+	if (!mapOk)
+	{
+		return;
+	}
+
+	// The map change cleared every record cache, and players who stayed connected get no new join ack to refill theirs.
+	KZGlobalService::UpdateRecordCache();
+	for (KZPlayer *player : g_pKZPlayerManager->GetAllSlots())
+	{
+		if (player->IsAuthenticated())
+		{
+			player->globalService->UpdatePlayerRecordCache();
+		}
+	}
+}
+
+void KZGlobalService::PrintAnnouncements()
+{
+	{
+		std::lock_guard _guard(KZGlobalService::globalAnnouncements.mutex);
+		for (const KZ::api::messages::handshake::HelloAck::Announcement &announcement : KZGlobalService::globalAnnouncements.announcements)
+		{
+			time_t now = std::time(nullptr);
+			if (announcement.startsAt > (u64)now || announcement.expiresAt < (u64)now)
+			{
+				continue;
+			}
+			if (!announcement.title.empty())
+			{
+				this->player->PrintChat(false, false, "{yellow}GLOBAL {grey}| %s", announcement.title.c_str());
+			}
+			if (!announcement.body.empty())
+			{
+				this->player->PrintChat(false, false, "%s", announcement.body.c_str());
+			}
+		}
+	}
+}
+
+void KZGlobalService::SendMapChange()
+{
+	bool mapNameOk = false;
+	std::string currentMapName = g_pKZUtils->GetCurrentMapName(&mapNameOk);
+
+	if (!mapNameOk)
+	{
+		KZ_LOG_WARN(LogChannel::Global, "Failed to get current map name. Cannot send `map_change` event.\n");
+		return;
+	}
+
+	// Clear immediately so stale global map data isn't used for run submissions
+	// while waiting for the API response.
+	KZ_LOG_INFO(LogChannel::Global, "Sending map change for '%s'...\n", currentMapName.c_str());
+	{
+		std::lock_guard _guard(KZGlobalService::currentMap.mutex);
+		KZGlobalService::currentMap.info = std::nullopt;
+		KZGlobalService::currentMap.confirmed = false;
+	}
+
+	KZ::api::messages::MapChange message;
+	message.name = currentMapName;
+
+	KZGlobalService::MessageCallback<std::optional<KZ::api::Map>> callback(KZGlobalService::OnMapInfo, currentMapName);
+	KZGlobalService::WS::SendMessage(message, std::move(callback));
+}
+
+void KZGlobalService::OnActivateServer()
+{
+	if (KZGlobalService::state.load() == KZGlobalService::State::Uninitialized)
+	{
+		KZGlobalService::Init();
+	}
+
+	// Ensure that no stale map data survives map changes.
+	{
+		std::lock_guard _guard(KZGlobalService::currentMap.mutex);
+		KZGlobalService::currentMap.info = std::nullopt;
+		KZGlobalService::currentMap.confirmed = false;
+	}
+
+	switch (KZGlobalService::state.load())
+	{
+		case KZGlobalService::State::Configured:
+		{
+			KZ_LOG_INFO(LogChannel::Global, "Starting WebSocket...\n");
+			KZGlobalService::WS::socket->start();
+			KZGlobalService::state.store(KZGlobalService::State::Connecting);
+		}
+		break;
+
+		case KZGlobalService::State::HandshakeCompleted:
+		{
+			KZGlobalService::SendMapChange();
+		}
+		break;
+	}
+}
+
+void KZGlobalService::OnServerGamePostSimulate()
+{
+	// Main-thread drain for everything the WebSocket thread queued up. The callbacks run here, so
+	// whatever they allocate belongs to Global too.
+
+	// Replays go over HTTP, so they don't have to wait for the WebSocket connection.
+	KZGlobalService::replayManager.ProcessUploads();
+
+	switch (KZGlobalService::state.load())
+	{
+		case KZGlobalService::State::Connected:
+		{
+			KZGlobalService::WS::InitiateHandshake();
+			return;
+		}
+		break;
+
+		case KZGlobalService::State::HandshakeInitiated:
+		{
+			std::optional<KZ::api::messages::handshake::HelloAck> helloAck;
+
+			{
+				std::lock_guard _guard(KZGlobalService::callbacks.mutex);
+				if (KZGlobalService::callbacks.helloAck)
+				{
+					KZGlobalService::callbacks.helloAck.swap(helloAck);
+				}
+			}
+
+			if (helloAck)
+			{
+				KZGlobalService::WS::CompleteHandshake(std::move(helloAck.value()));
+			}
+		}
+		break;
+
+		case KZGlobalService::State::HandshakeCompleted:
+		{
+			{
+				std::lock_guard _guard(KZGlobalService::callbacks.mutex);
+				if (!KZGlobalService::callbacks.queue.empty())
+				{
+					KZ_LOG_INFO(LogChannel::Global, "Running callbacks...\n");
+					for (const std::function<void()> &callback : KZGlobalService::callbacks.queue)
+					{
+						callback();
+					}
+					KZGlobalService::callbacks.queue.clear();
+				}
+			}
+
+			{
+				std::unordered_map<u32, std::unique_ptr<MessageCallbackInternal>> messageCallbacks;
+
+				{
+					std::lock_guard _messageCallbacksQueueGuard(KZGlobalService::ws.messageCallbacks.mutex);
+					KZGlobalService::ws.messageCallbacks.callbacks.swap(messageCallbacks);
+				}
+
+				std::lock_guard _messagesQueueGuard(KZGlobalService::ws.receivedMessages.mutex);
+				// for (WS::ReceivedMessage &message : KZGlobalService::ws.receivedMessages.queue)
+				for (auto it = KZGlobalService::ws.receivedMessages.queue.begin(); it != KZGlobalService::ws.receivedMessages.queue.end();)
+				{
+					auto callbackHandle = messageCallbacks.extract(it->id);
+					if (!callbackHandle)
+					{
+						++it;
+						continue;
+					}
+
+					KZ_LOG_INFO(LogChannel::Global, "Running callback for message %i...\n", it->id);
+
+					if (it->isError)
+					{
+						KZ::api::messages::Error error;
+
+						if (error.FromJson(it->payload))
+						{
+							callbackHandle.mapped()->OnError(it->id, error);
+						}
+						else
+						{
+							KZ_LOG_WARN(LogChannel::Global, "Failed to decode `error` message (messageID=%i)\n", it->id);
+						}
+					}
+					else if ((std::chrono::system_clock::now() - callbackHandle.mapped()->sentAt) > callbackHandle.mapped()->expiresAfter)
+					{
+						callbackHandle.mapped()->OnCancelled(it->id, KZGlobalService::MessageCallbackCancelReason::Timeout);
+					}
+					else
+					{
+						callbackHandle.mapped()->OnResponse(it->id, it->payload);
+					}
+
+					it = KZGlobalService::ws.receivedMessages.queue.erase(it);
+				}
+
+				KZGlobalService::ws.receivedMessages.queue.clear();
+
+				// Time out callbacks whose response never arrived. Without this they would sit in
+				// the map forever on a connection that stays open.
+				const auto now = std::chrono::system_clock::now();
+				for (auto it = messageCallbacks.begin(); it != messageCallbacks.end();)
+				{
+					if ((now - it->second->sentAt) > it->second->expiresAfter)
+					{
+						it->second->OnCancelled(it->first, KZGlobalService::MessageCallbackCancelReason::Timeout);
+						it = messageCallbacks.erase(it);
+					}
+					else
+					{
+						++it;
+					}
+				}
+
+				{
+					std::lock_guard _messageCallbacksQueueGuard(KZGlobalService::ws.messageCallbacks.mutex);
+					KZGlobalService::ws.messageCallbacks.callbacks.merge(messageCallbacks);
+				}
+			}
+		}
+		break;
+
+		default:
+			break;
+	}
+}
+
+static_function void OnPlayerRecordsReceived(const KZ::api::messages::PlayerRecords &records, u64 steamID)
+{
+	KZPlayer *player = g_pKZPlayerManager->SteamIdToPlayer(steamID);
+
+	if (player == nullptr)
+	{
+		return;
+	}
+
+	for (const KZ::api::Record &record : records.records)
+	{
+		const KZCourseDescriptor *course = KZ::course::GetCourseByGlobalCourseID(record.course.id);
+
+		if (course == nullptr)
+		{
+			continue;
+		}
+
+		PluginId modeID = KZ::mode::GetModeInfo(record.mode).id;
+
+		// Never let a slower record overwrite a faster one.
+		const PBData *cached = player->timerService->GetGlobalCachedPB(course, modeID);
+
+		if (record.nubRank != 0 && (!cached || cached->overall.pbTime == 0 || record.time < cached->overall.pbTime))
+		{
+			player->timerService->InsertPBToCache(record.time, course, modeID, true, true, "", record.nubPoints);
+		}
+
+		// Inserting may rehash the cache and invalidate the pointer above.
+		cached = player->timerService->GetGlobalCachedPB(course, modeID);
+
+		if (record.proRank != 0 && record.teleports == 0 && (!cached || cached->pro.pbTime == 0 || record.time < cached->pro.pbTime))
+		{
+			player->timerService->InsertPBToCache(record.time, course, modeID, false, true, "", record.proPoints);
+		}
+	}
+}
+
+void KZGlobalService::OnPlayerJoinAck(const KZ::api::messages::PlayerJoinAck &ack, u64 steamID)
+{
+	KZ_LOG_INFO(LogChannel::Global, "Received `player_join_ack` response. (player.id=%llu, player.is_banned=%s, player.has_prime=%s)\n", steamID,
+				ack.isBanned ? "true" : "false", ack.hasPrime ? "true" : "false");
+
+	KZPlayer *player = g_pKZPlayerManager->SteamIdToPlayer(steamID);
+	if (player == nullptr)
+	{
+		return;
+	}
+
+	player->globalService->playerInfo.isBanned = ack.isBanned;
+	player->hasPrime |= ack.hasPrime; // Players cannot lose Prime status.
+	player->optionService->InitializeGlobalPrefs(ack.preferences.ToString());
+
+	player->globalService->UpdatePlayerRecordCache();
+}
+
+void KZGlobalService::UpdatePlayerRecordCache()
+{
+	u16 currentMapID = KZGlobalService::WithCurrentMap([](const std::optional<KZ::api::Map> &map) { return map ? map->id : 0; });
+
+	if (currentMapID == 0)
+	{
+		return;
+	}
+
+	u64 steamID = this->player->GetSteamId64();
+	KZ::api::messages::WantPlayerRecords message;
+	message.mapID = currentMapID;
+	message.playerID = steamID;
+
+	KZGlobalService::MessageCallback<KZ::api::messages::PlayerRecords> callback(OnPlayerRecordsReceived, steamID);
+	KZGlobalService::WS::SendMessage(message, std::move(callback));
+}
+
+void KZGlobalService::OnPlayerAuthorized()
+{
+	if (KZGlobalService::state.load() != KZGlobalService::State::HandshakeCompleted)
+	{
+		return;
+	}
+
+	if (!this->player->IsConnected())
+	{
+		return;
+	}
+	assert(this->player->IsAuthenticated());
+
+	u64 steamID = this->player->GetSteamId64();
+	std::string stringifiedSteamID = std::to_string(steamID);
+
+	KZ::api::messages::PlayerJoin message;
+	message.id = stringifiedSteamID;
+	message.name = this->player->GetName();
+	const char *ipAddress = this->player->GetIpAddress();
+	if (ipAddress && !KZ_STREQI(ipAddress, "unknown"))
+	{
+		message.ipAddress = ipAddress;
+	}
+	else
+	{
+		message.ipAddress = "";
+	}
+	message.hasPrime = this->player->CheckPrime();
+
+	KZGlobalService::MessageCallback<KZ::api::messages::PlayerJoinAck> callback(KZGlobalService::OnPlayerJoinAck, steamID);
+	KZGlobalService::WS::SendMessage(message, std::move(callback));
+}
+
+void KZGlobalService::OnClientDisconnect()
+{
+	if (KZGlobalService::state.load() != KZGlobalService::State::HandshakeCompleted)
+	{
+		return;
+	}
+
+	// A player who stays away already left the API when their client disconnected, and joins it again once they are back.
+	if (this->player->IsAway() || !this->player->IsAuthenticated())
+	{
+		return;
+	}
+
+	// The API replaces the stored preferences with whatever this message carries and will not take one without them.
+	// Before the join ack arrives there is nothing safe to send, and the next join covers the API's session bookkeeping.
+	if (!this->player->optionService->CanSaveGlobalPrefs())
+	{
+		return;
+	}
+
+	u64 steamID = this->player->GetSteamId64();
+	std::string stringifiedSteamID = std::to_string(steamID);
+
+	KZ::api::messages::PlayerLeave message;
+	message.id = stringifiedSteamID;
+	message.name = this->player->GetName();
+
+	std::string getPrefsError;
+	std::string getPrefsResult;
+	this->player->optionService->GetPreferencesAsJSON(&getPrefsError, &getPrefsResult);
+	if (getPrefsError.empty())
+	{
+		message.preferences = Json(getPrefsResult.c_str());
+	}
+
+	KZGlobalService::WS::SendMessage(message);
+}
+
+void KZGlobalService::WS::OnMessage(const ix::WebSocketMessagePtr &message)
+{
+	// Runs on the ixwebsocket thread. JSON parsing here allocates heavily and the results are
+	// handed to the main thread through the queues below, so the scope has to sit on this side.
+
+	switch (message->type)
+	{
+		case ix::WebSocketMessageType::Open:
+			return KZGlobalService::WS::OnOpenMessage();
+
+		case ix::WebSocketMessageType::Close:
+			return KZGlobalService::WS::OnCloseMessage(message->closeInfo);
+
+		case ix::WebSocketMessageType::Error:
+			return KZGlobalService::WS::OnErrorMessage(message->errorInfo);
+
+		case ix::WebSocketMessageType::Ping:
+			KZ_LOG_DEBUG(LogChannel::Global, "Received ping WebSocket message.\n");
+			return;
+
+		case ix::WebSocketMessageType::Pong:
+			KZ_LOG_DEBUG(LogChannel::Global, "Received pong WebSocket message.\n");
+			return;
+	}
+
+	KZ_LOG_DEBUG(LogChannel::Global,
+				 "Received WebSocket message.\n"
+				 "----------------------------------------\n"
+				 "%s"
+				 "\n----------------------------------------\n",
+				 message->str.c_str());
+
+	Json payload(message->str);
+
+	if (!payload.IsValid())
+	{
+		KZ_LOG_INFO(LogChannel::Global, "Incoming WebSocket message is not valid JSON.\n");
+		return;
+	}
+
+	switch (KZGlobalService::state.load())
+	{
+		case KZGlobalService::State::HandshakeInitiated:
+		{
+			KZ::api::messages::handshake::HelloAck ack;
+
+			if (!ack.FromJson(payload))
+			{
+				// maybe?
+				// KZGlobalService::socket->stop();
+				KZGlobalService::state.store(KZGlobalService::State::Disconnected);
+				KZ_LOG_WARN(LogChannel::Global, "Failed to decode `hello_ack` message.\n");
+				break;
+			}
+
+			{
+				std::lock_guard _guard(KZGlobalService::callbacks.mutex);
+				KZGlobalService::callbacks.helloAck = std::make_optional(std::move(ack));
+			}
+		}
+		break;
+
+		case KZGlobalService::State::HandshakeCompleted:
+		{
+			u32 messageID;
+			if (!payload.Get("id", messageID))
+			{
+				KZ_LOG_WARN(LogChannel::Global, "Incoming WebSocket message did not contain a valid `id` field.\n");
+				break;
+			}
+
+			std::string event;
+			if (!payload.Get("event", event))
+			{
+				KZ_LOG_WARN(LogChannel::Global, "Incoming WebSocket message did not contain a valid `event` field.\n");
+				break;
+			}
+
+			ReceivedMessage receivedMessage;
+			receivedMessage.id = messageID;
+			receivedMessage.isError = (event == "error");
+
+			if (!payload.Get("data", receivedMessage.payload))
+			{
+				KZ_LOG_WARN(LogChannel::Global, "Incoming WebSocket message contained an invalid `data` field.\n");
+				break;
+			}
+
+			{
+				std::lock_guard _guard(KZGlobalService::ws.receivedMessages.mutex);
+				KZGlobalService::ws.receivedMessages.queue.emplace_back(std::move(receivedMessage));
+			}
+		}
+		break;
+
+		default:
+			return;
+	}
+}
+
+void KZGlobalService::WS::OnOpenMessage()
+{
+	KZGlobalService::state.store(KZGlobalService::State::Connected);
+	KZ_LOG_INFO(LogChannel::Global, "WebSocket connection established.\n");
+}
+
+void KZGlobalService::WS::OnCloseMessage(const ix::WebSocketCloseInfo &closeInfo)
+{
+	KZ_LOG_INFO(LogChannel::Global, "WebSocket connection closed (%i): %s\n", closeInfo.code, closeInfo.reason.c_str());
+
+	switch (closeInfo.code)
+	{
+		case 1000 /* NORMAL */:
+		case 1001 /* GOING AWAY */:
+		case 1006 /* ABNORMAL */:
+		{
+			KZGlobalService::WS::socket->enableAutomaticReconnection();
+			KZGlobalService::WS::socket->setMinWaitBetweenReconnectionRetries(10'000 /* ms */);
+			KZGlobalService::state.store(KZGlobalService::State::Reconnecting);
+		}
+		break;
+
+		case 1008 /* POLICY VIOLATION */:
+		{
+			if (closeInfo.reason.find("heartbeat timeout") != -1)
+			{
+				KZGlobalService::WS::socket->enableAutomaticReconnection();
+				KZGlobalService::state.store(KZGlobalService::State::Reconnecting);
+			}
+			else
+			{
+				KZGlobalService::WS::socket->disableAutomaticReconnection();
+				KZGlobalService::state.store(KZGlobalService::State::Disconnected);
+			}
+		}
+		break;
+
+		default:
+		{
+			KZGlobalService::WS::socket->enableAutomaticReconnection();
+			KZGlobalService::WS::socket->setMinWaitBetweenReconnectionRetries(60'000 /* ms */);
+			KZGlobalService::state.store(KZGlobalService::State::Reconnecting);
+		}
+	}
+
+	{
+		std::lock_guard _guard(KZGlobalService::callbacks.mutex);
+		KZGlobalService::callbacks.queue.clear();
+	}
+
+	{
+		std::lock_guard _messagesQueueGuard(KZGlobalService::ws.receivedMessages.mutex);
+		KZGlobalService::ws.receivedMessages.queue.clear();
+	}
+
+	{
+		std::lock_guard _messageCallbacksQueueGuard(KZGlobalService::ws.messageCallbacks.mutex);
+		for (const auto &[messageID, callback] : KZGlobalService::ws.messageCallbacks.callbacks)
+		{
+			callback->OnCancelled(messageID, KZGlobalService::MessageCallbackCancelReason::Disconnect);
+		}
+		KZGlobalService::ws.messageCallbacks.callbacks.clear();
+	}
+}
+
+void KZGlobalService::WS::OnErrorMessage(const ix::WebSocketErrorInfo &errorInfo)
+{
+	KZ_LOG_WARN(LogChannel::Global, "WebSocket error (status %i, retries=%i, wait_time=%f): %s\n", errorInfo.http_status, errorInfo.retries,
+				errorInfo.wait_time, errorInfo.reason.c_str());
+
+	switch (errorInfo.http_status)
+	{
+		case 401:
+		case 403:
+		{
+			KZGlobalService::WS::socket->disableAutomaticReconnection();
+			KZGlobalService::state.store(KZGlobalService::State::Disconnected);
+		}
+		break;
+
+		default:
+		{
+			KZGlobalService::WS::socket->enableAutomaticReconnection();
+			KZGlobalService::WS::socket->setMinWaitBetweenReconnectionRetries(60'000 /* ms */);
+			KZGlobalService::state.store(KZGlobalService::State::Reconnecting);
+		}
+	}
+}
+
+void KZGlobalService::WS::InitiateHandshake()
+{
+	KZGlobalService::State currentState = KZGlobalService::state.load();
+
+	if (currentState != KZGlobalService::State::Connected)
+	{
+		return;
+	}
+
+	if (!KZGlobalService::state.compare_exchange_strong(currentState, KZGlobalService::State::HandshakeInitiated))
+	{
+		return;
+	}
+
+	KZ_LOG_INFO(LogChannel::Global, "Initiating WebSocket handshake...\n");
+
+	bool mapNameOk = false;
+	std::string currentMapName = g_pKZUtils->GetCurrentMapName(&mapNameOk);
+
+	if (!mapNameOk)
+	{
+		KZ_LOG_WARN(LogChannel::Global, "Failed to get current map name.\n");
+		KZGlobalService::state.store(KZGlobalService::State::Disconnected);
+		return;
+	}
+
+	KZGlobalService::WS::handshakeMapName = currentMapName.c_str();
+	KZ::api::messages::handshake::Hello hello(g_KZPlugin.GetMD5(), currentMapName.c_str());
+
+	for (Player *player : g_pPlayerManager->GetAllSlots())
+	{
+		if (player->IsAuthenticated())
+		{
+			hello.AddPlayer(player->GetSteamId64(), player->GetName());
+		}
+	}
+
+	KZGlobalService::WS::socket->send(Json(hello).ToString());
+}
+
+void KZGlobalService::WS::CompleteHandshake(KZ::api::messages::handshake::HelloAck &&ack)
+{
+	KZGlobalService::State currentState = KZGlobalService::state.load();
+
+	if ((currentState != KZGlobalService::State::HandshakeInitiated) && (currentState != KZGlobalService::State::Reconnecting))
+	{
+		KZ_LOG_WARN(LogChannel::Global, "Unexpected state when calling `CompleteHandshake()`.\n");
+	}
+
+	KZ_LOG_INFO(LogChannel::Global, "Completing WebSocket handshake...\n");
+	// KZ_LOG_INFO(LogChannel::Global, "WebSocket session ID: `%s`\n", ack.sessionID.c_str());
+
+	bool mapMismatch = false;
+
+	{
+		bool mapOk = false;
+		std::string currentMapName = g_pKZUtils->GetCurrentMapName(&mapOk);
+
+		if (mapOk && currentMapName == KZGlobalService::WS::handshakeMapName)
+		{
+			char md5[33];
+			g_pKZUtils->GetCurrentMapMD5(md5, sizeof(md5));
+			if (!ack.mapInfo.has_value())
+			{
+				KZ_LOG_WARN(LogChannel::Global, "Current map %s is not approved.\n", currentMapName.c_str());
+				mapOk = false;
+			}
+			else if (ack.mapInfo.value().vpkChecksum != md5)
+			{
+				KZ_LOG_WARN(LogChannel::Global, "Checksum mismatch for current map (expected %s, got %s); treating as unapproved.\n", md5,
+							ack.mapInfo.value().vpkChecksum.c_str());
+				mapOk = false;
+			}
+		}
+		else
+		{
+			KZ_LOG_INFO(LogChannel::Global, "Map changed during handshake (sent '%s', current '%s'); re-sending map_change.\n",
+						KZGlobalService::WS::handshakeMapName.c_str(), mapOk ? currentMapName.c_str() : "<unknown>");
+			mapOk = false;
+			mapMismatch = true;
+		}
+
+		if (mapOk)
+		{
+			RegisterGlobalCourseIDs(ack.mapInfo.value());
+		}
+
+		{
+			std::lock_guard _guard(KZGlobalService::currentMap.mutex);
+			KZGlobalService::currentMap.info = mapOk ? std::move(ack.mapInfo) : std::nullopt;
+			KZGlobalService::currentMap.confirmed = true;
+		}
+	}
+
+	{
+		std::lock_guard _guard(KZGlobalService::globalModes.mutex);
+
+		for (const KZ::api::messages::handshake::HelloAck::ModeInfo &modeInfo : ack.modes)
+		{
+			switch (modeInfo.mode)
+			{
+				case KZ::api::Mode::Vanilla:
+				{
+#ifdef _WIN32
+					KZGlobalService::globalModes.checksums.vanilla = modeInfo.windowsChecksum;
+#else
+					KZGlobalService::globalModes.checksums.vanilla = modeInfo.linuxChecksum;
+#endif
+				}
+				break;
+
+				case KZ::api::Mode::Classic:
+				{
+#ifdef _WIN32
+					KZGlobalService::globalModes.checksums.classic = modeInfo.windowsChecksum;
+#else
+					KZGlobalService::globalModes.checksums.classic = modeInfo.linuxChecksum;
+#endif
+				}
+				break;
+			}
+		}
+	}
+
+	{
+		std::lock_guard _guard(KZGlobalService::globalStyles.mutex);
+		KZGlobalService::globalStyles.checksums.clear();
+
+		for (const KZ::api::messages::handshake::HelloAck::StyleInfo &styleInfo : ack.styles)
+		{
+#ifdef _WIN32
+			const std::string &checksum = styleInfo.windowsChecksum;
+#else
+			const std::string &checksum = styleInfo.linuxChecksum;
+#endif
+
+			KZGlobalService::globalStyles.checksums.emplace_back(KZGlobalService::GlobalStyleChecksum {styleInfo.style, checksum});
+		}
+	}
+
+	{
+		std::lock_guard _guard(KZGlobalService::globalAnnouncements.mutex);
+		KZGlobalService::globalAnnouncements.announcements.swap(ack.announcements);
+	}
+
+	if (!KZGlobalService::state.compare_exchange_strong(currentState, KZGlobalService::State::HandshakeCompleted))
+	{
+		KZ_LOG_INFO(LogChannel::Global, "State changed unexpectedly during `CompleteHandshake()`.\n");
+	}
+
+	if (mapMismatch)
+	{
+		KZGlobalService::SendMapChange();
+	}
+	else
+	{
+		KZGlobalService::UpdateRecordCache();
+	}
+
+	for (KZPlayer *player : g_pKZPlayerManager->GetAllSlots())
+	{
+		if (player->IsAuthenticated())
+		{
+			player->globalService->OnPlayerAuthorized();
+		}
+	}
+}
+
+void KZGlobalService::OnPrimeStatusConfirmed()
+{
+	if (KZGlobalService::state.load() != KZGlobalService::State::HandshakeCompleted)
+	{
+		return;
+	}
+
+	// Send a message to the API that the player has been confirmed to have prime status.
+	KZ::api::messages::PlayerPrimeConfirmed message;
+	message.id = this->player->GetSteamId64();
+	KZGlobalService::WS::SendMessage(message);
+}

@@ -1,0 +1,321 @@
+#include "kz_language.h"
+#include "utils/utils.h"
+#include "utils/simplecmds.h"
+#include "tier0/keyvalues.h"
+#include "interfaces/interfaces.h"
+#include "filesystem/ifilesystem.h"
+#include "utils/ctimer.h"
+#include "kz/option/kz_option.h"
+#include "kz/checkpoint/kz_checkpoint.h"
+#include "kz/timer/kz_timer.h"
+
+#include "utils/cvarquery.h"
+#include <vendor/MultiAddonManager/public/imultiaddonmanager.h>
+
+extern IMultiAddonManager *g_pMultiAddonManager;
+
+static_global class KZOptionServiceEventListener_Language : public KZOptionServiceEventListener
+{
+	virtual void OnPlayerPreferencesLoaded(KZPlayer *player)
+	{
+		player->languageService->OnPlayerPreferencesLoaded();
+	}
+} optionEventListener;
+
+static_global KeyValues *translationKV;
+static_global KeyValues *languagesKV;
+static_global KeyValues *addonsKV;
+
+void KZLanguageService::Init()
+{
+	KZLanguageService::LoadConfigFiles();
+	KZOptionService::RegisterEventListener(&optionEventListener);
+}
+
+void KZLanguageService::OnActivateServer()
+{
+	// Cleanup caches.
+	auto &infos = KZLanguageService::clientLanguageInfos;
+	for (auto it = infos.begin(); it != infos.end();)
+	{
+		it = g_pKZPlayerManager->SteamIdToPlayer(it->first, false) ? std::next(it) : infos.erase(it);
+	}
+
+	KZLanguageService::ClearTemplateCache();
+}
+
+void KZLanguageService::LoadConfigFiles()
+{
+	if (translationKV)
+	{
+		delete translationKV;
+	}
+	if (languagesKV)
+	{
+		delete languagesKV;
+	}
+	if (addonsKV)
+	{
+		delete addonsKV;
+	}
+	translationKV = new KeyValues("Phrases");
+	translationKV->UsesEscapeSequences(true);
+	languagesKV = new KeyValues("Languages");
+	languagesKV->UsesEscapeSequences(true);
+	addonsKV = new KeyValues("Addons");
+	addonsKV->UsesEscapeSequences(true);
+	KZLanguageService::LoadTranslations();
+	KZLanguageService::LoadLanguages();
+	KZLanguageService::ClearTemplateCache();
+}
+
+void KZLanguageService::Cleanup()
+{
+	if (translationKV)
+	{
+		delete translationKV;
+	}
+	if (languagesKV)
+	{
+		delete languagesKV;
+		if (addonsKV)
+		{
+			delete addonsKV;
+		}
+	}
+}
+
+const char *KZLanguageService::GetBaseAddon()
+{
+	return addonsKV->GetString(KZ_BASE_ADDON_KEY, KZ_WORKSHOP_ADDON_ID);
+}
+
+static_global std::vector<KZLanguageService::AvailableLanguage> availableLanguages;
+
+const std::vector<KZLanguageService::AvailableLanguage> &KZLanguageService::GetAvailableLanguages()
+{
+	if (!availableLanguages.empty() || !translationKV)
+	{
+		return availableLanguages;
+	}
+
+	std::vector<i32> phraseCounts;
+	i32 totalPhrases = 0;
+	for (KeyValues *phrase = translationKV->GetFirstSubKey(); phrase; phrase = phrase->GetNextKey())
+	{
+		totalPhrases++;
+		for (KeyValues *lang = phrase->GetFirstSubKey(); lang; lang = lang->GetNextKey())
+		{
+			const char *code = lang->GetName();
+			if (!code || code[0] == '#')
+			{
+				continue;
+			}
+			i32 index = -1;
+			for (i32 i = 0; i < (i32)availableLanguages.size(); i++)
+			{
+				if (V_stricmp(availableLanguages[i].code.c_str(), code) == 0)
+				{
+					index = i;
+					break;
+				}
+			}
+			if (index < 0)
+			{
+				// config.txt maps a Steam language name to each code; use the first one as the label.
+				std::string steamName = code;
+				for (KeyValues *named = languagesKV ? languagesKV->GetFirstSubKey() : nullptr; named; named = named->GetNextKey())
+				{
+					if (V_stricmp(named->GetString(nullptr, ""), code) == 0)
+					{
+						steamName = named->GetName();
+						break;
+					}
+				}
+				availableLanguages.push_back({code, steamName, 0});
+				phraseCounts.push_back(0);
+				index = (i32)availableLanguages.size() - 1;
+			}
+			phraseCounts[index]++;
+		}
+	}
+	for (i32 i = 0; i < (i32)availableLanguages.size(); i++)
+	{
+		availableLanguages[i].coverage = totalPhrases > 0 ? phraseCounts[i] * 100 / totalPhrases : 0;
+	}
+	return availableLanguages;
+}
+
+void KZLanguageService::LoadLanguages()
+{
+	char fullPath[1024];
+	g_SMAPI->PathFormat(fullPath, sizeof(fullPath), "%s/addons/cs2kz/translations/config.txt", g_SMAPI->GetBaseDir());
+	if (!languagesKV->LoadFromFile(g_pFullFileSystem, fullPath, nullptr))
+	{
+		KZ_LOG_WARN(LogChannel::Language, "Failed to load translation config file.\n");
+	}
+	g_SMAPI->PathFormat(fullPath, sizeof(fullPath), "%s/addons/cs2kz/translations/menu-addons.txt", g_SMAPI->GetBaseDir());
+	if (!addonsKV->LoadFromFile(g_pFullFileSystem, fullPath, nullptr))
+	{
+		KZ_LOG_WARN(LogChannel::Language, "Failed to load addon config file.\n");
+	}
+}
+
+void KZLanguageService::LoadTranslations()
+{
+	char buffer[1024];
+	g_SMAPI->PathFormat(buffer, sizeof(buffer), "addons/cs2kz/translations/*.phrases.txt");
+	FileFindHandle_t findHandle = {};
+	const char *fileName = g_pFullFileSystem->FindFirst(buffer, &findHandle);
+	if (fileName)
+	{
+		do
+		{
+			char fullPath[1024];
+			g_SMAPI->PathFormat(fullPath, sizeof(fullPath), "%s/addons/cs2kz/translations/%s", g_SMAPI->GetBaseDir(), fileName);
+			if (!translationKV->LoadFromFile(g_pFullFileSystem, fullPath, nullptr))
+			{
+				KZ_LOG_WARN(LogChannel::Language, "Failed to load %s\n", fileName);
+			}
+			fileName = g_pFullFileSystem->FindNext(findHandle);
+		} while (fileName);
+		g_pFullFileSystem->FindClose(findHandle);
+	}
+}
+
+void KZLanguageService::OnPlayerPreferencesLoaded()
+{
+	const char *language = this->player->optionService->GetPreferenceStr("preferredLanguage");
+	bool shouldReconnect = !(this->player->checkpointService->GetCheckpointCount() || this->player->timerService->GetTimerRunning());
+	if (language[0])
+	{
+		KZLanguageService::UpdateLanguage(this->player->GetSteamId64(false), language, LanguageInfo::CacheLevel::CACHE_PREF, shouldReconnect);
+		if (!shouldReconnect)
+		{
+			this->player->languageService->PrintChat(false, false, "Language Change - Manual Menu Change Required");
+		}
+	}
+}
+
+const char *KZLanguageService::GetLanguage()
+{
+	auto it = KZLanguageService::clientLanguageInfos.find(this->player->GetSteamId64(false));
+	if (it == KZLanguageService::clientLanguageInfos.end())
+	{
+		return KZOptionService::GetOptionStr("defaultLanguage", KZ_DEFAULT_LANGUAGE);
+	}
+	return it->second.language;
+}
+
+const char *KZLanguageService::GetTranslatedFormat(const char *language, const char *phrase)
+{
+	if (!translationKV->FindKey(phrase))
+	{
+		// KZ_LOG_DEBUG(LogChannel::Language, "Warning: Phrase '%s' not found, returning orignal message!\n", phrase);
+		return phrase;
+	}
+	const char *outFormat = translationKV->FindKey(phrase)->GetString(language);
+	if (outFormat[0] == '\0')
+	{
+		if (!V_stricmp(language, "#format"))
+		{
+			// It is fine to have no format.
+			return NULL;
+		}
+		// KZ_LOG_DEBUG(LogChannel::Language, "Warning: Phrase '%s' not found for language %s!\n", phrase, language);
+		return translationKV->FindKey(phrase)->GetString(KZ_DEFAULT_LANGUAGE);
+	}
+	return outFormat;
+}
+
+void KZLanguageService::UpdateLanguage(u64 xuid, const char *langKey, LanguageInfo::CacheLevel cacheLevel, bool shouldReconnect)
+{
+	// Manual override > Loaded preference > Queried ConVar
+	auto &langInfo = KZLanguageService::clientLanguageInfos[xuid];
+	const char *addon = addonsKV->GetString(langKey, addonsKV->GetString(KZOptionService::GetOptionStr("defaultLanguage", KZ_DEFAULT_LANGUAGE)));
+	if (langInfo.cacheLevel > cacheLevel)
+	{
+		return;
+	}
+	langInfo.cacheLevel = cacheLevel;
+	if (!KZ_STREQILEN(langInfo.lastAddon, addon, sizeof(langInfo.lastAddon)))
+	{
+		if (KZ_STREQI(langInfo.lastAddon, KZLanguageService::GetBaseAddon()))
+		{
+			KZ_LOG_INFO(LogChannel::Language, "Adding %s for client %llu\n", addon, xuid);
+		}
+		else
+		{
+			KZ_LOG_INFO(LogChannel::Language, "Adding %s and removing %s for client %llu\n", addon, langInfo.lastAddon, xuid);
+		}
+		if (g_pMultiAddonManager)
+		{
+			g_pMultiAddonManager->RemoveClientAddon(langInfo.lastAddon, xuid);
+			g_pMultiAddonManager->AddClientAddon(addon, xuid, shouldReconnect);
+		}
+		V_strncpy(langInfo.lastAddon, addon, sizeof(langInfo.lastAddon));
+	}
+	V_strncpy(langInfo.language, langKey, sizeof(langInfo.language));
+}
+
+void KZLanguageService::OnPlayerConnect(u64 steamID64)
+{
+	if (!steamID64)
+	{
+		return;
+	}
+	auto it = KZLanguageService::clientLanguageInfos.find(steamID64);
+	if (it != KZLanguageService::clientLanguageInfos.end() && it->second.cacheLevel > LanguageInfo::CacheLevel::CACHE_NONE)
+	{
+		return;
+	}
+	this->UpdateLanguage(steamID64, KZOptionService::GetOptionStr("defaultLanguage", KZ_DEFAULT_LANGUAGE), LanguageInfo::CacheLevel::CACHE_NONE,
+						 false);
+	{
+		// clang-format off
+		cvarquery::Query(this->player->GetPlayerSlot(), "cl_language",
+			[steamID64](CPlayerSlot nSlot, cvarquery::Status eStatus, const char *pszCvarName, const char *pszCvarValue)
+			{
+				if (eStatus == cvarquery::Status::ValueIntact)
+				{
+					const char* langKey = languagesKV->GetString(pszCvarValue, pszCvarValue);
+					KZ_LOG_INFO(LogChannel::Language, "Received client convar value: %s\n", langKey);
+					KZLanguageService::UpdateLanguage(steamID64, langKey, LanguageInfo::CacheLevel::CACHE_CVAR, true);
+				}
+		});
+		// clang-format on
+	}
+}
+
+KZLanguageService::LanguageInfo::LanguageInfo()
+{
+	V_strncpy(this->language, KZOptionService::GetOptionStr("defaultLanguage", KZ_DEFAULT_LANGUAGE), sizeof(this->language));
+}
+
+SCMD(kz_language, SCFL_PREFERENCE)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	if (args->ArgC() < 2 || !args->Arg(1)[0])
+	{
+		player->languageService->PrintChat(true, false, "Language Command Usage");
+		return true;
+	}
+	char language[32] {};
+	V_snprintf(language, sizeof(language), "%s", args->Arg(1));
+	V_strlower(language);
+	bool shouldReconnect = !(player->checkpointService->GetCheckpointCount() || player->timerService->GetTimerRunning());
+	KZLanguageService::UpdateLanguage(player->GetSteamId64(false), language, KZLanguageService::LanguageInfo::CacheLevel::CACHE_OVERRIDE,
+									  shouldReconnect);
+	player->optionService->SetPreferenceStr("preferredLanguage", language);
+	if (!shouldReconnect)
+	{
+		player->languageService->PrintChat(true, false, "Switch Language", language);
+		player->languageService->PrintChat(false, false, "Language Change - Manual Menu Change Required");
+	}
+	return true;
+}
+
+CON_COMMAND_F(kz_reload_translations, "Reload translation configuration files", FCVAR_NONE)
+{
+	KZLanguageService::LoadConfigFiles();
+}

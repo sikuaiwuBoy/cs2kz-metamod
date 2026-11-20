@@ -1,0 +1,202 @@
+#include "kz_anticheat.h"
+#include "kz/global/kz_global.h"
+#include "kz/db/kz_db.h"
+#include "kz/replays/kz_replay.h"
+#include "utils/async_file_io.h"
+
+KZAnticheatService::Infraction *KZAnticheatService::GetPendingInfraction(const UUID_t &infractionId)
+{
+	for (KZAnticheatService::Infraction &infraction : KZAnticheatService::pendingBans)
+	{
+		if (infraction.id == infractionId && !infraction.submitted)
+		{
+			return &infraction;
+		}
+	}
+	return nullptr;
+}
+
+KZAnticheatService::Infraction *KZAnticheatService::GetPendingInfraction()
+{
+	for (KZAnticheatService::Infraction &infraction : KZAnticheatService::pendingBans)
+	{
+		if (infraction.steamID == this->player->GetSteamId64() && !infraction.submitted)
+		{
+			return &infraction;
+		}
+	}
+	return nullptr;
+}
+
+void KZAnticheatService::CleanupInfractions()
+{
+	auto &infractions = KZAnticheatService::pendingBans;
+	// clang-format off
+	infractions.erase(std::remove_if(infractions.begin(), infractions.end(),
+		[](const KZAnticheatService::Infraction &infraction)
+		{
+			return infraction.submitted && infraction.replay == nullptr;
+		}), infractions.end());
+	// clang-format on
+}
+
+void KZAnticheatService::MarkInfraction(Infraction::Type type, const std::string &details)
+{
+	if (!this->ShouldRunDetections())
+	{
+		return;
+	}
+	if (!this->player->IsAuthenticated())
+	{
+		// Cannot mark infraction for unauthenticated players, so we just kick them.
+		this->player->Kick("Invalid Steam Logon", NETWORK_DISCONNECT_STEAM_LOGON);
+		return;
+	}
+
+	if (!this->CanReceiveInfraction())
+	{
+		return;
+	}
+	this->MarkBanned(KZAnticheatBanSource::Detection, Infraction::kickInternalReasons[static_cast<u8>(type)]);
+	// MarkBanned does nothing for a ban carried over from an earlier session.
+	this->banSource = KZAnticheatBanSource::Detection;
+
+	KZ_LOG_INFO(LogChannel::AC, "Marking infraction (%s) for player %s (%llu): %s\n", Infraction::kickInternalReasons[static_cast<u8>(type)],
+				this->player->GetName(), this->player->GetSteamId64(), details.c_str());
+
+	Infraction &infraction = KZAnticheatService::pendingBans.emplace_back();
+	infraction.type = type;
+	infraction.details = details;
+	infraction.steamID = this->player->GetSteamId64();
+
+	if (Infraction::shouldGenerateReplay[static_cast<u8>(type)])
+	{
+		infraction.replay = std::make_unique<CheaterRecorder>(this->player, details.c_str(), nullptr);
+		this->player->recordingService->CopyWeaponsToRecorder(infraction.replay.get());
+		infraction.replayUUID = infraction.replay->uuid;
+	}
+	infraction.SubmitGlobalInfraction();
+}
+
+void KZAnticheatService::Infraction::SubmitGlobalInfraction()
+{
+	// TODO Anticheat: Make API call to submit global infraction
+	this->OnGlobalSubmitFailure();
+}
+
+void KZAnticheatService::Infraction::OnGlobalSubmitSuccess(const UUID_t &infractionId, const UUID_t &replayUUID, f32 banDuration)
+{
+	// Update infraction info with data from API.
+	this->id = infractionId;
+	this->banDuration = banDuration;
+	this->replayUUID = replayUUID;
+	if (this->replay)
+	{
+		this->replay.get()->uuid = replayUUID;
+	}
+	this->SubmitLocalInfraction();
+	// TODO Anticheat: Upload the replay once the API hands out upload keys for infractions.
+	this->SaveReplay();
+}
+
+void KZAnticheatService::Infraction::OnGlobalSubmitFailure()
+{
+	this->banDuration = KZAnticheatService::Infraction::banDurations[(u8)this->type];
+	this->SubmitLocalInfraction();
+	this->SaveReplay();
+}
+
+void KZAnticheatService::Infraction::SubmitLocalInfraction()
+{
+	if (!KZDatabaseService::IsReady())
+	{
+		this->Finalize();
+		return;
+	}
+	auto &id = this->id;
+	auto onSuccess = [id](std::vector<ISQLQuery *> queries)
+	{
+		KZ_LOG_INFO(LogChannel::AC, "Saved local infraction %s\n", id.ToString().c_str());
+		if (KZAnticheatService::Infraction *infraction = KZAnticheatService::GetPendingInfraction(id))
+		{
+			infraction->Finalize();
+		}
+	};
+	auto onFailure = [id](std::string error, int failIndex)
+	{
+		KZ_LOG_WARN(LogChannel::AC, "Failed to record local infraction %s: %s\n", id.ToString().c_str(), error.c_str());
+		if (KZAnticheatService::Infraction *infraction = KZAnticheatService::GetPendingInfraction(id))
+		{
+			infraction->Finalize();
+		}
+	};
+	KZDatabaseService::Ban(this->steamID, this->GetBanReason().c_str(), this->banDuration, this->id, this->replayUUID, onSuccess, onFailure);
+}
+
+std::string KZAnticheatService::Infraction::GetBanReason() const
+{
+	return tfm::format("%s: %s", kickInternalReasons[static_cast<u8>(this->type)], this->details);
+}
+
+ENetworkDisconnectionReason KZAnticheatService::Infraction::GetRejoinKickReason(const char *banReason)
+{
+	for (u8 i = 0; i < static_cast<u8>(Type::COUNT); i++)
+	{
+		if (kickReasons[i] != NETWORK_DISCONNECT_KICKED_INPUTAUTOMATION)
+		{
+			continue;
+		}
+		size_t length = strlen(kickInternalReasons[i]);
+		if (KZ_STREQLEN(banReason, kickInternalReasons[i], length) && banReason[length] == ':')
+		{
+			return NETWORK_DISCONNECT_KICKED_INPUTAUTOMATION;
+		}
+	}
+	return NETWORK_DISCONNECT_KICKED_UNTRUSTEDACCOUNT;
+}
+
+void KZAnticheatService::Infraction::SaveReplay()
+{
+	if (!this->replay)
+	{
+		return;
+	}
+
+	std::string name = this->replay->replayHeader.player().name();
+	u64 steamID = this->steamID;
+
+	// clang-format off
+	KZRecordingService::fileWriter->QueueWrite(
+		std::move(this->replay),
+		// Success: write to disk.
+		[name, steamID](const UUID_t &uuid, f32 replayDuration, std::vector<char> &&buf)
+		{
+			char replayPath[512];
+			V_snprintf(replayPath, sizeof(replayPath), "%s/%s.replay", KZ_REPLAY_PATH, uuid.ToString().c_str());
+			if (g_asyncFileIO)
+			{
+				g_asyncFileIO->QueueWriteBuffer(replayPath, buf);
+			}
+			KZ_LOG_INFO(LogChannel::AC, "Cheater replay %s saved for player %s (%llu)\n", uuid.ToString().c_str(), name.c_str(), steamID);
+		},
+		// Failure
+		[name, steamID](const char *error)
+		{
+			KZ_LOG_WARN(LogChannel::AC, "Failed to save cheater replay for player %s (%llu) - Error: %s\n", name.c_str(), steamID,
+						error);
+		});
+	// clang-format on
+}
+
+void KZAnticheatService::Infraction::Finalize()
+{
+	this->submitted = true;
+	// Kick the player if not already gone
+	KZPlayer *player = g_pKZPlayerManager->SteamIdToPlayer(this->steamID);
+	if (!player)
+	{
+		return;
+	}
+
+	player->Kick(this->kickInternalReasons[static_cast<u8>(this->type)], Infraction::kickReasons[static_cast<u8>(this->type)]);
+};

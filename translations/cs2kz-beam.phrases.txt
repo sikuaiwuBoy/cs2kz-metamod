@@ -1,0 +1,83 @@
+"Phrases"
+{
+	"Beam Changed (None)"
+	{
+		"en"		"{grey}You have disabled your player beams."
+		"chi"		"{grey}你已关闭玩家光束效果."
+		"zho"		"{grey}你已關閉玩家光束效果."
+		"pl"		"{grey}Wyłączyłeś smugi swojego gracza."
+		"sv"		"{grey}Du har inaktiverat din spelarstråle."
+		"ua"		"{grey}Ви вимкнули промені руху під час стрибка."
+		"de"		"{grey}Du hast deinen Spielerstrahl ausgestellt."
+		"ru"		"{grey}Вы отключили лучи траектории прыжка."
+		"es"		"{grey}Has desactivado tu haz de luz."
+		"ko"		"{grey}플레이어 빔을 비활성화했습니다."
+	}
+	"Beam Changed (Ground)"
+	{
+		"en"		"{grey}You have set your player beam type to {default}Ground{grey}."
+		"chi"		"{grey}你已将玩家光束类型设置为 {default}地面{grey}."
+		"zho"		"{grey}你已將玩家光束類型設定為 {default}地面{grey}."
+		"pl"		"{grey}Ustawiłeś rodzaj smugi gracza na {default}Ziemia{grey}."
+		"sv"		"{grey}Du har ställt in din spelarstråltyp till {default}Mark{grey}."
+		"ua"		"{grey}Ви встановили тип променя — {default}По землі{grey}."
+		"de"		"{grey}Du hast deinen Spielerstrahl-Typ auf {default}Boden{grey} umgestellt."
+		"ru"		"{grey}Вы установили тип луча — {default}Земля{grey}."
+		"es"		"{grey}Has establecido el estilo de tu haz de luz a {default}Suelo{grey}(Ground)."
+		"ko"		"{grey}플레이어 빔 유형을 {default}Ground(바닥){grey}으로 설정했습니다."
+	}
+	"Beam Changed (Feet)"
+	{
+		"en"		"{grey}You have set your player beam type to {default}Feet{grey}."
+		"chi"		"{grey}你已将玩家光束类型设置为 {default}脚下{grey}."
+		"zho"		"{grey}你已將玩家光束類型設定為 {default}腳下{grey}."
+		"pl"		"{grey}Ustawiłeś rodzaj smugi gracza na {default}Stopy{grey}."
+		"sv"		"{grey}Du har ställt in din spelarstråltyp till {default}Fötter{grey}."
+		"ua"		"{grey}Ви встановили тип променя — {default}Від ніг{grey}."
+		"de"		"{grey}Du hast deinen Spielerstrahl-Typ auf {default}Füße{grey} umgestellt."
+		"ru"		"{grey}Вы установили тип луча — {default}Ноги{grey}."
+		"es"		"{grey}Has establecido el estilo de tu haz de luz a {default}Pies{grey}(Feet)."
+		"ko"		"{grey}플레이어 빔 유형을 {default}Feet(발){grey}으로 설정했습니다."
+	}
+	"Beam Offset Command Usage"
+	{
+		"en"		"{grey}Usage: {default}kz_beamoffset <x> <y> <z>"
+		"chi"		"{grey}用法: {default}kz_beamoffset <x> <y> <z>"
+		"zho"		"{grey}用法: {default}kz_beamoffset <x> <y> <z>"
+		"pl"		"{grey}Użycie: {default}kz_beamoffset <x> <y> <z>"
+		"sv"		"{grey}Användning: {default}kz_beamoffset <x> <y> <z>"
+		"ua"		"{grey}Використання: {default}kz_beamoffset <x> <y> <z>"
+		"de"		"{grey}Verwendung: {default}kz_beamoffset <x> <y> <z>"
+		"ru"		"{grey}Применение: {default}kz_beamoffset <x> <y> <z>"
+		"es"		"{grey}Uso: {default}kz_beamoffset <x> <y> <z>"
+		"ko"		"{grey}사용법: {default}kz_beamoffset <x> <y> <z>"
+	}
+	"Beam Command Usage"
+	{
+		"en"		"{grey}Usage: {default}kz_beam <off/feet/ground>"
+		"chi"		"{grey}用法：{default}kz_beam <off/feet/ground>"
+		"zho"		"{grey}用法：{default}kz_beam <off/feet/ground>"
+		"pl"		"{grey}Użycie: {default}kz_beam <off/feet/ground>"
+		"sv"		"{grey}Användning: {default}kz_beam <off/feet/ground>"
+		"ua"		"{grey}Використання：{default}kz_beam <off/feet/ground>"
+		"de"		"{grey}Verwendung: {default}kz_beam <off/feet/ground>"
+		"ru"		"{grey}Применение: {default}kz_beam <off/feet/ground>"
+		"es"		"{grey}Uso: {default}kz_beam <off/feet/ground>"
+		"ko"		"{grey}사용법: {default}kz_beam <off/feet/ground>"
+	}
+	"Current Beam Offset"
+	{
+		// Current beam offset: 0.00 0.00 1.75
+		"#format"	"x:.2f,y:.2f,z:.2f"
+		"en"		"{grey}Current beam offset: {default}{x} {y} {z}"
+		"chi"		"{grey}当前光束偏移：{default}{x} {y} {z}"
+		"zho"		"{grey}目前光束偏移：{default}{x} {y} {z}"
+		"pl"		"{grey}Aktualne przesunięcie smugi: {default}{x} {y} {z}"
+		"sv"		"{grey}Nuvarande stråloffset: {default}{x} {y} {z}"
+		"ua"		"{grey}Поточне зміщення променя: {default}{x} {y} {z}"
+		"de"		"{grey}Aktueller Spielerstrahl-Offset: {default}{x} {y} {z}"
+		"ru"		"{grey}Текущий сдвиг луча: {default}{x} {y} {z}"
+		"es"		"{grey}El ajuste de la posición de tu haz de luz es: {default}{x} {y} {z}"
+		"ko"		"{grey}현재 빔 오프셋: {default}{x} {y} {z}"
+	}
+}

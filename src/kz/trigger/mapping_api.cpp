@@ -1,0 +1,407 @@
+#include "kz_trigger.h"
+#include "kz/checkpoint/kz_checkpoint.h"
+#include "kz/recording/kz_recording.h"
+#include "kz/jumpstats/kz_jumpstats.h"
+#include "kz/language/kz_language.h"
+#include "kz/mode/kz_mode.h"
+#include "kz/style/kz_style.h"
+#include "kz/timer/kz_timer.h"
+
+#include <algorithm>
+
+namespace
+{
+	// Cache the cvar references for the modifier triggers.
+	struct ModifierCvarRefs
+	{
+		ConVarRefAbstract airAccelerate {"sv_airaccelerate"};
+		ConVarRefAbstract standableNormal {"sv_standable_normal"};
+		ConVarRefAbstract walkableNormal {"sv_walkable_normal"};
+		ConVarRefAbstract jumpSpamPenaltyTime {"sv_jump_spam_penalty_time"};
+		ConVarRefAbstract autoBunnyhopping {"sv_autobunnyhopping"};
+		ConVarRefAbstract jumpImpulse {"sv_jump_impulse"};
+		ConVarRefAbstract staminaJumpCost {"sv_staminajumpcost"};
+	};
+
+	ModifierCvarRefs &Cvars()
+	{
+		static ModifierCvarRefs refs;
+		return refs;
+	}
+} // namespace
+
+void KZTriggerService::ResetBhopState()
+{
+	this->lastTouchedSingleBhop = CEntityHandle();
+	// all hail fixed buffers
+	this->lastTouchedSequentialBhops.clear();
+}
+
+void KZTriggerService::UpdateModifiersInternal()
+{
+	// The apply paths have to run every time because KZ::mode::ApplyModeSettings resets the underlying cvars to the
+	// mode values on every ProcessMovement. The cancel paths only need to run on the transition out of the modifier:
+	// once cancelled, ApplyModeSettings is what keeps those cvars at the mode values.
+	if (this->modifiers.enableSlideCount > 0)
+	{
+		this->ApplySlide();
+	}
+	else if (this->slideApplied)
+	{
+		this->CancelSlide();
+	}
+
+	if (this->antiBhopActive)
+	{
+		this->ApplyAntiBhop();
+	}
+	else if (this->antiBhopApplied)
+	{
+		this->CancelAntiBhop();
+	}
+
+	if (this->modifiers.forcedDuckCount > 0)
+	{
+		this->ApplyForcedDuck();
+	}
+	else if (this->lastModifiers.forcedDuckCount > 0)
+	{
+		this->CancelForcedDuck();
+	}
+
+	if (this->modifiers.forcedUnduckCount > 0)
+	{
+		this->ApplyForcedUnduck();
+	}
+	else if (this->lastModifiers.forcedUnduckCount > 0)
+	{
+		this->CancelForcedUnduck();
+	}
+}
+
+void KZTriggerService::UpdateModifierCounts()
+{
+	Modifiers counts {};
+	counts.jumpFactor = this->modifiers.jumpFactor;
+	i32 bhopCount = 0;
+	for (const TriggerTouchTracker &tracker : this->triggerTrackers)
+	{
+		// Round restarts can hand the table slot to another trigger.
+		if (!tracker.kzTrigger || !tracker.mappingApiStartedTouch || tracker.kzTrigger->entity != tracker.triggerHandle)
+		{
+			continue;
+		}
+		if (KZ::mapapi::IsBhopTrigger(tracker.kzTrigger->type))
+		{
+			bhopCount++;
+			continue;
+		}
+		if (tracker.kzTrigger->type != KZTRIGGER_MODIFIER)
+		{
+			continue;
+		}
+		const KzMapModifier &modifier = tracker.kzTrigger->modifier;
+		counts.disablePausingCount += modifier.disablePausing ? 1 : 0;
+		counts.disableCheckpointsCount += modifier.disableCheckpoints ? 1 : 0;
+		counts.disableTeleportsCount += modifier.disableTeleports ? 1 : 0;
+		counts.disableJumpstatsCount += modifier.disableJumpstats ? 1 : 0;
+		// Enabling slide will also disable jumpstats.
+		counts.disableJumpstatsCount += modifier.enableSlide ? 1 : 0;
+		counts.enableSlideCount += modifier.enableSlide ? 1 : 0;
+		// Modifying jump velocity will also disable jumpstats.
+		counts.disableJumpstatsCount += modifier.jumpFactor != 1.0f ? 1 : 0;
+		// Modifying force (un)duck will also disable jumpstats.
+		counts.disableJumpstatsCount += modifier.forceDuck || modifier.forceUnduck ? 1 : 0;
+		counts.forcedDuckCount += modifier.forceDuck ? 1 : 0;
+		counts.forcedUnduckCount += modifier.forceUnduck ? 1 : 0;
+	}
+	this->modifiers = counts;
+	this->bhopTouchCount = bhopCount;
+}
+
+bool KZTriggerService::InAntiPauseArea()
+{
+	return this->modifiers.disablePausingCount > 0;
+}
+
+bool KZTriggerService::InBhopTriggers()
+{
+	for (size_t i = 0; i < this->triggerTrackers.size(); i++)
+	{
+		bool justTouched = g_pKZUtils->GetServerGlobals()->curtime - this->triggerTrackers[i].startTouchTime < 0.15f;
+		if (justTouched && this->triggerTrackers[i].isPossibleLegacyBhopTrigger)
+		{
+			return true;
+		}
+	}
+	return this->bhopTouchCount > 0;
+}
+
+bool KZTriggerService::InAntiCpArea()
+{
+	return this->modifiers.disableCheckpointsCount > 0;
+}
+
+bool KZTriggerService::CanTeleportToCheckpoints()
+{
+	return this->modifiers.disableTeleportsCount <= 0;
+}
+
+bool KZTriggerService::ShouldDisableJumpstats()
+{
+	return this->modifiers.disableJumpstatsCount > 0;
+}
+
+void KZTriggerService::TouchModifierTrigger(TriggerTouchTracker tracker)
+{
+	const KzTrigger *trigger = tracker.kzTrigger;
+
+	if (trigger->modifier.gravity != 1)
+	{
+		// No gravity while paused.
+		if (this->player->timerService->GetPaused())
+		{
+			this->player->GetPlayerPawn()->SetGravityScale(0);
+			return;
+		}
+		this->player->GetPlayerPawn()->SetGravityScale(trigger->modifier.gravity);
+	}
+	this->modifiers.jumpFactor = trigger->modifier.jumpFactor;
+}
+
+void KZTriggerService::TouchAntibhopTrigger(TriggerTouchTracker tracker)
+{
+	f32 timeOnGround = g_pKZUtils->GetServerGlobals()->curtime - this->player->landingTimeServer;
+	if (tracker.kzTrigger->antibhop.time == 0                            // No jump trigger
+		|| timeOnGround <= tracker.kzTrigger->antibhop.time              // Haven't touched the trigger for long enough
+		|| (this->player->GetPlayerPawn()->m_fFlags & FL_ONGROUND) == 0) // Not on the ground (for prediction)
+	{
+		this->antiBhopActive = true;
+	}
+}
+
+bool KZTriggerService::TouchTeleportTrigger(TriggerTouchTracker tracker)
+{
+	bool shouldTeleport = false;
+
+	bool isBhopTrigger = KZ::mapapi::IsBhopTrigger(tracker.kzTrigger->type);
+	// Do not teleport the player if it's a bhop trigger and they are not on the ground.
+	if (isBhopTrigger && (this->player->GetPlayerPawn()->m_fFlags & FL_ONGROUND) == 0)
+	{
+		return false;
+	}
+
+	CEntityHandle destinationHandle = GameEntitySystem()->FindFirstEntityHandleByName(tracker.kzTrigger->teleport.destination);
+	CBaseEntity *destination = dynamic_cast<CBaseEntity *>(GameEntitySystem()->GetEntityInstance(destinationHandle));
+	if (!destinationHandle.IsValid() || !destination)
+	{
+		KZ_LOG_WARN(LogChannel::Trigger, "Invalid teleport destination \"%s\" on trigger with hammerID %i.\n",
+					tracker.kzTrigger->teleport.destination, tracker.kzTrigger->hammerId);
+		return false;
+	}
+
+	Vector destOrigin = destination->m_CBodyComponent()->m_pSceneNode()->m_vecAbsOrigin();
+	QAngle destAngles = destination->m_CBodyComponent()->m_pSceneNode()->m_angRotation();
+	CBaseEntity *trigger = dynamic_cast<CBaseTrigger *>(GameEntitySystem()->GetEntityInstance(tracker.kzTrigger->entity));
+	Vector triggerOrigin = Vector(0, 0, 0);
+	if (trigger)
+	{
+		triggerOrigin = trigger->m_CBodyComponent()->m_pSceneNode()->m_vecAbsOrigin();
+	}
+
+	// NOTE: We only use the trigger's origin if we're using a relative destination, so if
+	// we're not using a relative destination and don't have it, then it's fine.
+	// TODO: Can this actually happen? If the trigger is touched then the entity must be valid.
+	if (!trigger && tracker.kzTrigger->teleport.relative)
+	{
+		return false;
+	}
+
+	if (isBhopTrigger && (this->player->GetPlayerPawn()->m_fFlags & FL_ONGROUND))
+	{
+		f32 effectiveStartTouchTime = MAX(this->player->landingTimeServer, tracker.startTouchTime);
+		f32 touchingTime = g_pKZUtils->GetServerGlobals()->curtime - effectiveStartTouchTime;
+		if (touchingTime > tracker.kzTrigger->teleport.delay)
+		{
+			shouldTeleport = true;
+		}
+		else if (tracker.kzTrigger->type == KZTRIGGER_SINGLE_BHOP)
+		{
+			shouldTeleport = this->lastTouchedSingleBhop == tracker.kzTrigger->entity;
+		}
+		else if (tracker.kzTrigger->type == KZTRIGGER_SEQUENTIAL_BHOP)
+		{
+			const auto &bhops = this->lastTouchedSequentialBhops;
+			if (std::find(bhops.begin(), bhops.end(), tracker.kzTrigger->entity) != bhops.end())
+			{
+				shouldTeleport = true;
+			}
+		}
+	}
+	else if (tracker.kzTrigger->type == KZTRIGGER_TELEPORT)
+	{
+		f32 touchingTime = g_pKZUtils->GetServerGlobals()->curtime - tracker.startTouchTime;
+		shouldTeleport = touchingTime > tracker.kzTrigger->teleport.delay || tracker.kzTrigger->teleport.delay <= 0;
+	}
+
+	if (!shouldTeleport)
+	{
+		return false;
+	}
+	// The mapping API explicitly distinguishes failed bhop teleports from normal
+	// map teleports. Position proximity alone cannot identify a failed section.
+	KZRecordingService::ScopedTeleport replayTeleport(*this->player->recordingService, isBhopTrigger ? RPTELEPORT_BHOP_FAIL : RPTELEPORT_MAP_TRIGGER);
+
+	bool shouldReorientPlayer = tracker.kzTrigger->teleport.reorientPlayer && destAngles[YAW] != 0;
+	Vector up = Vector(0, 0, 1);
+	Vector finalOrigin = destOrigin;
+
+	if (tracker.kzTrigger->teleport.relative)
+	{
+		Vector playerOrigin;
+		this->player->GetOrigin(&playerOrigin);
+		Vector playerOffsetFromTrigger = playerOrigin - triggerOrigin;
+
+		if (shouldReorientPlayer)
+		{
+			VectorRotate(playerOffsetFromTrigger, QAngle(0, destAngles[YAW], 0), playerOffsetFromTrigger);
+		}
+
+		finalOrigin = destOrigin + playerOffsetFromTrigger;
+	}
+	QAngle finalPlayerAngles;
+	this->player->GetAngles(&finalPlayerAngles);
+	Vector finalVelocity;
+	this->player->GetVelocity(&finalVelocity);
+	if (shouldReorientPlayer)
+	{
+		// TODO: BUG: sometimes when getting reoriented and holding a movement key
+		//  the player's speed will get reduced, almost like velocity rotation
+		//  and angle rotation is out of sync leading to counterstrafing.
+		// Maybe we should check m_nHighestGeneratedServerViewAngleChangeIndex for angles overridding...
+		VectorRotate(finalVelocity, QAngle(0, destAngles[YAW], 0), finalVelocity);
+		finalPlayerAngles[YAW] -= destAngles[YAW];
+	}
+	else if (!tracker.kzTrigger->teleport.reorientPlayer && tracker.kzTrigger->teleport.useDestinationAngles)
+	{
+		finalPlayerAngles = destAngles;
+	}
+
+	if (tracker.kzTrigger->teleport.resetSpeed)
+	{
+		finalVelocity = vec3_origin;
+	}
+	bool changeAngles = shouldReorientPlayer || (!tracker.kzTrigger->teleport.reorientPlayer && tracker.kzTrigger->teleport.useDestinationAngles);
+	// Angle, velocity and position changes are one mapping API teleport even when
+	// SetVelocity only updates movement data instead of issuing an engine call.
+	this->player->OnTeleportBegin(&finalOrigin, changeAngles ? &finalPlayerAngles : nullptr, &finalVelocity);
+	if (changeAngles)
+	{
+		this->player->SetAngles(finalPlayerAngles);
+	}
+	this->player->SetVelocity(finalVelocity);
+	// Prevent the player from being teleported into the air for one tick if they were on the ground before teleporting.
+	CEntityHandle groundEntity = this->player->GetPlayerPawn()->m_hGroundEntity();
+	bool restoreGround = this->player->GetPlayerPawn()->m_fFlags & FL_ONGROUND && groundEntity.IsValid();
+	this->player->Teleport(&finalOrigin, NULL, NULL);
+	if (restoreGround)
+	{
+		this->player->GetPlayerPawn()->m_fFlags(this->player->GetPlayerPawn()->m_fFlags | FL_ONGROUND);
+		this->player->GetPlayerPawn()->m_hGroundEntity(groundEntity);
+	}
+	this->player->OnTeleportEnd();
+	return true;
+}
+
+void KZTriggerService::TouchPushTrigger(TriggerTouchTracker tracker)
+{
+	u32 pushConditions = tracker.kzTrigger->push.pushConditions;
+	// clang-format off
+	if (pushConditions & KzMapPush::KZ_PUSH_TOUCH
+		|| (this->player->IsButtonNewlyPressed(IN_ATTACK) && pushConditions & KzMapPush::KZ_PUSH_ATTACK)
+		|| (this->player->IsButtonNewlyPressed(IN_ATTACK2) && pushConditions & KzMapPush::KZ_PUSH_ATTACK2)
+		|| (this->player->IsButtonNewlyPressed(IN_JUMP) && pushConditions & KzMapPush::KZ_PUSH_JUMP_BUTTON)
+		|| (this->player->IsButtonNewlyPressed(IN_USE) && pushConditions & KzMapPush::KZ_PUSH_USE))
+	// clang-format on
+	{
+		this->AddPushEvent(tracker.kzTrigger);
+	}
+}
+
+void KZTriggerService::ApplySlide(bool replicate)
+{
+	const CVValue_t *aaValue = player->GetCvarValueFromModeStyles(MODECVAR_SV_AIRACCELERATE);
+	const CVValue_t newAA = aaValue->m_fl32Value * 4.0f;
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().standableNormal, "2", replicate);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().walkableNormal, "2", replicate);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().airAccelerate, &newAA, replicate);
+	this->slideApplied = true;
+}
+
+void KZTriggerService::CancelSlide(bool replicate)
+{
+	const CVValue_t *standableValue = player->GetCvarValueFromModeStyles(MODECVAR_SV_STANDABLE_NORMAL);
+	const CVValue_t *walkableValue = player->GetCvarValueFromModeStyles(MODECVAR_SV_WALKABLE_NORMAL);
+	const CVValue_t *aaValue = player->GetCvarValueFromModeStyles(MODECVAR_SV_AIRACCELERATE);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().airAccelerate, aaValue, replicate);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().standableNormal, standableValue, replicate);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().walkableNormal, walkableValue, replicate);
+	this->slideApplied = false;
+}
+
+void KZTriggerService::ApplyAntiBhop(bool replicate)
+{
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().jumpSpamPenaltyTime, "999999.9", replicate);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().autoBunnyhopping, "false", replicate);
+	player->GetMoveServices()->m_LegacyJump().m_bOldJumpPressed() = true;
+	player->GetMoveServices()->m_ModernJump().m_nLastActualJumpPressTick() = 5529600; // Magic number to prevent jumps
+	this->antiBhopApplied = true;
+}
+
+void KZTriggerService::CancelAntiBhop(bool replicate)
+{
+	const CVValue_t *spamModeValue = player->GetCvarValueFromModeStyles(MODECVAR_SV_JUMP_SPAM_PENALTY_TIME);
+	const CVValue_t *autoBhopValue = player->GetCvarValueFromModeStyles(MODECVAR_SV_AUTOBUNNYHOPPING);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().jumpSpamPenaltyTime, spamModeValue, replicate);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().autoBunnyhopping, autoBhopValue, replicate);
+
+	if (player->GetMoveServices()->m_ModernJump().m_nLastActualJumpPressTick() > g_pKZUtils->GetServerGlobals()->tickcount)
+	{
+		player->GetMoveServices()->m_ModernJump().m_nLastActualJumpPressTick() = 0;
+	}
+	this->antiBhopApplied = false;
+}
+
+void KZTriggerService::ApplyForcedDuck()
+{
+	this->player->GetMoveServices()->m_bDuckOverride(true);
+}
+
+void KZTriggerService::CancelForcedDuck()
+{
+	this->player->GetMoveServices()->m_bDuckOverride(false);
+}
+
+void KZTriggerService::ApplyForcedUnduck()
+{
+	// Set crouch time to a very large value so that the player cannot reduck.
+	this->player->GetMoveServices()->m_flLastDuckTime(100000.0f);
+	// This needs to be done every tick just since the player can be in spots that are not unduckable (eg. crouch tunnels)
+	this->player->GetPlayerPawn()->m_fFlags(this->player->GetPlayerPawn()->m_fFlags() & ~FL_DUCKING);
+}
+
+void KZTriggerService::CancelForcedUnduck()
+{
+	this->player->GetMoveServices()->m_flLastDuckTime(0.0f);
+}
+
+void KZTriggerService::ApplyJumpFactor(bool replicate)
+{
+	const CVValue_t *impulseModeValue = player->GetCvarValueFromModeStyles(MODECVAR_SV_JUMP_IMPULSE);
+	const CVValue_t newImpulseValue = (impulseModeValue->m_fl32Value * this->modifiers.jumpFactor);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().jumpImpulse, &newImpulseValue, replicate);
+
+	const CVValue_t *jumpCostValue = player->GetCvarValueFromModeStyles(MODECVAR_SV_STAMINAJUMPCOST);
+	const CVValue_t newJumpCostValue = (jumpCostValue->m_fl32Value / this->modifiers.jumpFactor);
+	utils::SetConVarValue(player->GetPlayerSlot(), Cvars().staminaJumpCost, &newJumpCostValue, replicate);
+}

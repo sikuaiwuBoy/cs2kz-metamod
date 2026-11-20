@@ -1,0 +1,170 @@
+// CS2KZ Menu (Russian)
+// Russian radio menu support addon for CS2KZ plugin.
+"RadioPanel.txt"
+{
+	"Groups"
+	{
+		"menu_simple"
+		{
+			"hotkey"	"0"
+			"title"		"TP Меню (Простое)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"Чекпоинт"
+					"cmd"		"radio; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"Телепорт"
+					"cmd"		"radio; say /tp"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"3"
+					"label"		"Пауза/Возобновить"
+					"cmd"		"radio; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"4"
+					"label"		"Рестарт/Респавн"
+					"cmd"		"radio; say /r"
+				}
+			}
+		}
+
+		"menu_advanced"
+		{
+			"hotkey"	"1"
+			"title"		"TP Меню (Расширенное)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"Чекпоинт (CP)"
+					"cmd"		"radio1; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"Телепорт (TP)"
+					"cmd"		"radio1; say /tp"
+				}
+
+				"Prev Checkpoint"
+				{
+					"hotkey"	"3"
+					"label"		"Предыдущий CP"
+					"cmd"		"radio1; say /prevcp"
+				}
+
+				"Next Checkpoint"
+				{
+					"hotkey"	"4"
+					"label"		"Следующий CP"
+					"cmd"		"radio1; say /nextcp"
+				}
+
+				"Undo Teleport"
+				{
+					"hotkey"	"5"
+					"label"		"Отменить TP"
+					"cmd"		"radio1; say /undo"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"6"
+					"label"		"Пауза/Возобновить"
+					"cmd"		"radio1; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"7"
+					"label"		"Рестарт/Респавн"
+					"cmd"		"radio1; say /r"
+				}
+
+				"Noclip"
+				{
+					"hotkey"	"8"
+					"label"		"Noclip"
+					"cmd"		"radio1; say /noclip"
+				}
+			}
+		}
+
+		"menu_option"
+		{
+			"hotkey"	"2"
+			"title"		"Меню настроек"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Set Custom Start Position"
+				{
+					"hotkey"	"1"
+					"label"		"Установить стартовую позицию"
+					"cmd"		"say /ssp"
+				}
+
+				"Clear Custom Start Position"
+				{
+					"hotkey"	"2"
+					"label"		"Сбросить стартовую позицию"
+					"cmd"		"say /csp"
+				}
+
+				"Hide"
+				{
+					"hotkey"	"3"
+					"label"		"Показать/Спрятать игроков"
+					"cmd"		"say /hide"
+				}
+
+				"Hide Weapon"
+				{
+					"hotkey"	"4"
+					"label"		"Показать/Спрятать оружие"
+					"cmd"		"say /hideweapon"
+				}
+
+				"Hide Legs"
+				{
+					"hotkey"	"5"
+					"label"		"Показать/Спрятать ноги"
+					"cmd"		"say /hidelegs"
+				}
+
+				"Toggle Jumpstats"
+				{
+					"hotkey"	"6"
+					"label"		"Вкл./Выкл. статистику прыжков"
+					"cmd"		"say /js"
+				}
+
+				"Toggle Jumpstats Always"
+				{
+					"hotkey"	"7"
+					"label"		"Всегда показывать статистику"
+					"cmd"		"say /jsalways"
+				}
+			}
+		}
+	}
+}

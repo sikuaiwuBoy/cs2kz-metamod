@@ -1,0 +1,530 @@
+#include "cstrike15_usermessages.pb.h"
+#include "usermessages.pb.h"
+#include "gameevents.pb.h"
+#include "cs_gameevents.pb.h"
+
+#include "sdk/entity/cparticlesystem.h"
+#include "sdk/entity/ccscustomplayercamera.h"
+#include "sdk/services.h"
+
+#include "kz_quiet.h"
+#include "kz/pistol/kz_pistol.h"
+#include "kz/beam/kz_beam.h"
+#include "kz/measure/kz_measure.h"
+#include "kz/ztopwatch/kz_ztopwatch.h"
+#include "kz/hud/kz_hud.h"
+#include "kz/option/kz_option.h"
+#include "kz/paint/kz_paint.h"
+#include "kz/language/kz_language.h"
+#include "kz/away/kz_away.h"
+
+#include "utils/utils.h"
+#include "utils/simplecmds.h"
+
+static_global class KZOptionServiceEventListener_Quiet : public KZOptionServiceEventListener
+{
+	virtual void OnPlayerPreferencesLoaded(KZPlayer *player)
+	{
+		player->quietService->ApplyPreferences();
+	}
+
+	virtual void OnPlayerPreferenceChanged(KZPlayer *player, const char *optionName)
+	{
+		if (KZ_STREQI(optionName, "hideWeapon") || KZ_STREQI(optionName, "hideOtherPlayers"))
+		{
+			player->quietService->ApplyPreferences();
+		}
+	}
+} optionEventListener;
+
+// The pawn of a player who is away or spectating is kept out of sight. A client takes a pawn linked to its own
+// controller for its own body and predicts it, so its owner would see it frozen.
+static_function bool ShouldHidePersistentPawn(KZPlayer *owner, KZPlayer *viewer)
+{
+	return !owner->awayService->CanControlPawn() && (owner != viewer || owner->awayService->IsObservingWithPersistentPawn());
+}
+
+// A pawn's weapons are sent on their own, and a client that spectated the pawn can show one as a first person model.
+static_function void HidePersistentPawnWeapons(CCheckTransmitInfo *pTransmitInfo, KZPlayer *viewer)
+{
+	for (KZPlayer *owner : g_pKZPlayerManager->GetAllSlots())
+	{
+		CCSPlayerPawn *pawn = ShouldHidePersistentPawn(owner, viewer) ? owner->GetPlayerPawn() : nullptr;
+		CPlayer_WeaponServices *weaponServices = pawn ? pawn->m_pWeaponServices() : nullptr;
+		if (!weaponServices)
+		{
+			continue;
+		}
+		CUtlVector<CHandle<CBasePlayerWeapon>> *weapons = weaponServices->m_hMyWeapons();
+		for (i32 i = 0; i < weapons->Count(); i++)
+		{
+			CBasePlayerWeapon *weapon = weapons->Element(i).Get();
+			if (weapon)
+			{
+				pTransmitInfo->m_pTransmitEntity->Clear(weapon->GetEntityIndex().Get());
+			}
+		}
+	}
+}
+
+void KZ::quiet::OnCheckTransmit(CCheckTransmitInfo **pInfo, int infoCount)
+{
+	for (int i = 0; i < infoCount; i++)
+	{
+		CCheckTransmitInfo *pTransmitInfo = pInfo[i];
+
+		// Find out who this info will be sent to.
+		CPlayerSlot targetSlot = pTransmitInfo->m_nPlayerSlot;
+		KZPlayer *targetPlayer = g_pKZPlayerManager->ToPlayer(targetSlot);
+		// Make sure the target isn't CSTV.
+		CCSPlayerController *targetController = targetPlayer ? targetPlayer->GetController() : nullptr;
+		if (!targetController || targetController->m_bIsHLTV)
+		{
+			continue;
+		}
+		targetPlayer->quietService->UpdateHideState();
+		HidePersistentPawnWeapons(pTransmitInfo, targetPlayer);
+
+		EntityInstanceByClassIter_t iterParticleSystem(NULL, "info_particle_system");
+
+		for (CParticleSystem *particleSystem = static_cast<CParticleSystem *>(iterParticleSystem.First()); particleSystem;
+			 particleSystem = static_cast<CParticleSystem *>(iterParticleSystem.Next()))
+		{
+			if (particleSystem->m_iTeamNum() != CUSTOM_PARTICLE_SYSTEM_TEAM)
+			{
+				continue; // Only hide custom particle systems created by the plugin.
+			}
+			if (targetPlayer->beamService->playerBeam == particleSystem->GetRefEHandle()
+				|| targetPlayer->beamService->playerBeamNew == particleSystem->GetRefEHandle())
+			{
+				// Don't hide the beam for the owner.
+				continue;
+			}
+			if (targetPlayer->measureService->measurerHandle == particleSystem->GetRefEHandle())
+			{
+				// Don't hide the measure beam for the owner.
+				continue;
+			}
+			bool isZtopwatchEdge = false;
+			for (int e = 0; e < KZZtopwatchService::Zone::NUM_EDGES; e++)
+			{
+				if (targetPlayer->ztopwatchService->startZone.edges[e] == particleSystem->GetRefEHandle()
+					|| targetPlayer->ztopwatchService->endZone.edges[e] == particleSystem->GetRefEHandle())
+				{
+					isZtopwatchEdge = true;
+					break;
+				}
+			}
+			if (isZtopwatchEdge)
+			{
+				// Don't hide zone stopwatch edges for the owner.
+				continue;
+			}
+
+			pTransmitInfo->m_pTransmitEntity->Clear(particleSystem->GetEntityIndex().Get());
+		}
+
+		EntityInstanceByClassIter_t iter(NULL, "player");
+		// clang-format off
+		for (CCSPlayerPawn *pawn = static_cast<CCSPlayerPawn *>(iter.First());
+			 pawn != NULL;
+			 pawn = pawn->m_pEntity->m_pNextByClass ? static_cast<CCSPlayerPawn *>(pawn->m_pEntity->m_pNextByClass->m_pInstance) : nullptr)
+		// clang-format on
+		{
+			// Bit is not even set, don't bother.
+			if (!pTransmitInfo->m_pTransmitEntity->IsBitSet(pawn->entindex()))
+			{
+				continue;
+			}
+			// Do not transmit a pawn without any controller to prevent crashes.
+			if (!pawn->m_hController().IsValid())
+			{
+				pTransmitInfo->m_pTransmitEntity->Clear(pawn->entindex());
+				continue;
+			}
+			// Respawn must be enabled or !hide will cause client crash.
+#if 0
+			// Never send dead players to prevent crashes.
+			if (pawn->m_lifeState() != LIFE_ALIVE)
+			{
+				pTransmitInfo->m_pTransmitEntity->Clear(pawn->entindex());
+				continue;
+			}
+#endif
+			KZPlayer *otherPlayer = g_pKZPlayerManager->ToPlayer(pawn);
+			// The controller handle can be stale, treat the pawn as if it had no controller.
+			if (!otherPlayer)
+			{
+				pTransmitInfo->m_pTransmitEntity->Clear(pawn->entindex());
+				continue;
+			}
+			if (ShouldHidePersistentPawn(otherPlayer, targetPlayer))
+			{
+				pTransmitInfo->m_pTransmitEntity->Clear(pawn->entindex());
+				continue;
+			}
+			// Finally check if player is using !hide.
+			if (!targetPlayer->quietService->ShouldHide())
+			{
+				continue;
+			}
+			if (targetPlayer->quietService->ShouldHideIndex(otherPlayer->index))
+			{
+				pTransmitInfo->m_pTransmitEntity->Clear(pawn->entindex());
+			}
+		}
+	}
+}
+
+static void FilterQuietClients(const uint64 *clients, u32 emitterPlayerIndex = 0)
+{
+	for (i32 recipientSlot = 0; recipientSlot < MAX_PLAYERS; recipientSlot++)
+	{
+		KZPlayer *recipient = g_pKZPlayerManager->ToPlayer(CPlayerSlot(recipientSlot));
+		if (recipient->quietService->ShouldHide() && (emitterPlayerIndex == 0 || recipient->quietService->ShouldHideIndex(emitterPlayerIndex)))
+		{
+			*(uint64 *)clients &= ~(1ull << recipientSlot);
+		}
+	}
+}
+
+void KZ::quiet::OnPostEvent(INetworkMessageInternal *pEvent, const CNetMessage *pData, const uint64 *clients)
+{
+	u32 emitterEntIndex = 0;
+	switch (pEvent->m_MessageId)
+	{
+		case GE_PlaceDecalEvent:
+		{
+			auto msg = const_cast<CNetMessage *>(pData)->ToPB<CMsgPlaceDecalEvent>();
+			if (msg->decal_group_name() != KZPaintService::DECAL_GROUP_NAME)
+			{
+				return;
+			}
+
+			u64 currentRecipients = *(const u64 *)clients;
+
+			// Find the player who initiated this paint.
+			for (i32 i = 0; i < MAX_PLAYERS; i++)
+			{
+				KZPlayer *painter = g_pKZPlayerManager->ToPlayer(CPlayerSlot(i));
+				if (!painter || !painter->paintService || !painter->paintService->pendingPaint)
+				{
+					continue;
+				}
+
+				u64 paintRecipients = 0;
+				for (i32 recipientSlot = 0; recipientSlot < MAX_PLAYERS; recipientSlot++)
+				{
+					u64 recipientBit = 1ull << recipientSlot;
+					if ((currentRecipients & recipientBit) == 0)
+					{
+						continue;
+					}
+
+					if (recipientSlot == i)
+					{
+						paintRecipients |= recipientBit;
+						continue;
+					}
+
+					KZPlayer *recipient = g_pKZPlayerManager->ToPlayer(CPlayerSlot(recipientSlot));
+					if (recipient && recipient->paintService && recipient->paintService->ShouldShowAllPaint())
+					{
+						paintRecipients |= recipientBit;
+					}
+				}
+
+				*(uint64 *)clients = paintRecipients;
+
+				Color color = painter->paintService->GetColor();
+				// Game expects ABGR; internal storage and user input are RGBA.
+				u32 colorPacked = ((u32)color.a() << 24) | ((u32)color.b() << 16) | ((u32)color.g() << 8) | (u32)color.r();
+				msg->set_color(colorPacked);
+				msg->set_size_override(painter->paintService->GetSize());
+				return;
+			}
+
+			// No painter found — suppress the decal entirely.
+			*(uint64 *)clients = 0;
+			return;
+		}
+		// Hide bullet decals, and sound.
+		case GE_FireBulletsId:
+		{
+			auto msg = const_cast<CNetMessage *>(pData)->ToPB<CMsgTEFireBullets>();
+			emitterEntIndex = msg->player() & 0x3FFF;
+			break;
+		}
+		// Hide reload sounds.
+		case CS_UM_WeaponSound:
+		{
+			auto msg = const_cast<CNetMessage *>(pData)->ToPB<CCSUsrMsg_WeaponSound>();
+			emitterEntIndex = msg->entidx();
+			break;
+		}
+		// Hide other sounds from player (eg. armor equipping)
+		case GE_SosStartSoundEvent:
+		{
+			auto msg = const_cast<CNetMessage *>(pData)->ToPB<CMsgSosStartSoundEvent>();
+			emitterEntIndex = msg->source_entity_index();
+			break;
+		}
+		// Used by kz_misc to block valve's player say messages.
+		case UM_SayText:
+		{
+			if (!KZOptionService::GetOptionInt("overridePlayerChat", true))
+			{
+				return;
+			}
+			auto msg = const_cast<CNetMessage *>(pData)->ToPB<CUserMessageSayText>();
+			i32 index = msg->playerindex();
+			if (index == -1)
+			{
+				return;
+			}
+			{
+				*(uint64 *)clients = 0;
+			}
+			return;
+		}
+		case UM_SayText2:
+		{
+			if (!KZOptionService::GetOptionInt("overridePlayerChat", true))
+			{
+				return;
+			}
+			auto msg = const_cast<CNetMessage *>(pData)->ToPB<CUserMessageSayText2>();
+			i32 index = msg->entityindex();
+			if (index == -1)
+			{
+				return;
+			}
+			if (!msg->mutable_param1()->empty() || !msg->mutable_param2()->empty())
+			{
+				*(uint64 *)clients = 0;
+			}
+			return;
+		}
+		default:
+		{
+			return;
+		}
+	}
+	CBaseEntity *emitterEnt = static_cast<CBaseEntity *>(GameEntitySystem()->GetEntityInstance(CEntityIndex(emitterEntIndex)));
+	if (emitterEntIndex == 0 || !emitterEnt)
+	{
+		return;
+	}
+
+	// Convert this entindex into the index in the player controller.
+	if (emitterEnt->IsPawn())
+	{
+		CBasePlayerPawn *pawn = static_cast<CBasePlayerPawn *>(emitterEnt);
+		// Without a player, the index stays 0 and the event is hidden from everyone having !hide enabled.
+		KZPlayer *emitter = g_pKZPlayerManager->ToPlayer(utils::GetController(pawn));
+		FilterQuietClients(clients, emitter ? emitter->index : 0);
+	}
+	else if (V_strstr(emitterEnt->GetClassname(), "weapon_"))
+	{
+		// Find the owner of the weapon if possible.
+		CBaseEntity *owner = emitterEnt->m_hOwnerEntity().Get();
+		if (owner && owner->IsPawn())
+		{
+			KZPlayer *emitter = g_pKZPlayerManager->ToPlayer(static_cast<CBasePlayerPawn *>(owner));
+			FilterQuietClients(clients, emitter ? emitter->index : 0);
+		}
+		// Otherwise just hide from everyone having !hide enabled.
+		else
+		{
+			FilterQuietClients(clients);
+		}
+	}
+	// Special case for the armor sound upon spawning/respawning, because the emitter player is not yet known.
+	else if (V_strcmp(emitterEnt->GetClassname(), "item_assaultsuit") == 0)
+	{
+		FilterQuietClients(clients);
+	}
+}
+
+void KZQuietService::Init()
+{
+	KZOptionService::RegisterEventListener(&optionEventListener);
+}
+
+void KZQuietService::Reset()
+{
+	this->hideOtherPlayers = this->player->optionService->GetPreferenceBool("hideOtherPlayers", false);
+	this->hideWeapon = this->player->optionService->GetPreferenceBool("hideWeapon", false);
+}
+
+void KZQuietService::SendFullUpdate()
+{
+	if (CServerSideClient *client = g_pKZUtils->GetClientBySlot(this->player->GetPlayerSlot()))
+	{
+		client->m_nDeltaTick = -1;
+	}
+	// Keep the player's angles the same.
+	QAngle angles;
+	this->player->GetAngles(&angles);
+	this->player->SetAngles(angles);
+}
+
+bool KZQuietService::ShouldHide()
+{
+	if (!this->hideOtherPlayers)
+	{
+		return false;
+	}
+
+	// If the player is not alive and not spectating another player, don't hide other players.
+	if (this->player->specService->IsObserving() && !this->player->specService->GetSpectatedPlayer())
+	{
+		return false;
+	}
+
+	return true;
+}
+
+bool KZQuietService::ShouldHideIndex(u32 targetIndex)
+{
+	// Don't self-hide.
+	if (this->player->index == targetIndex)
+	{
+		return false;
+	}
+
+	// Don't hide the player being spectated.
+	if (this->player->specService->GetSpectatedPlayer() && this->player->specService->GetSpectatedPlayer()->index == targetIndex)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+SCMD(kz_hideweapon, SCFL_PLAYER)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->quietService->ToggleHideWeapon();
+	return true;
+}
+
+void KZQuietService::ToggleHideWeapon()
+{
+	auto *opts = this->player->optionService;
+	opts->SetPreferenceBool("hideWeapon", !opts->GetPreferenceBool("hideWeapon", false));
+	this->player->languageService->PrintChat(true, false,
+											 this->hideWeapon ? "Quiet Option - Show Weapon - Disable" : "Quiet Option - Show Weapon - Enable");
+}
+
+void KZQuietService::OnPhysicsSimulatePost()
+{
+	this->UpdateWeaponCamera();
+}
+
+// A custom camera that follows the eyes is still the pawn's view entity, and the client skips the viewmodel
+// while one is set. The weapon itself stays networked, so the native crosshair keeps working.
+void KZQuietService::UpdateWeaponCamera()
+{
+	CCSPlayerPawn *pawn = this->player->GetPlayerPawn();
+	if (!this->hideWeapon || !pawn || !pawn->IsAlive())
+	{
+		this->ReleaseWeaponCamera();
+		return;
+	}
+	CCSCustomPlayerCamera *camera = static_cast<CCSCustomPlayerCamera *>(this->weaponCamera.Get());
+	if (!camera || camera->m_hPawn().Get() != pawn)
+	{
+		this->ReleaseWeaponCamera();
+		camera = CCSCustomPlayerCamera::Create(pawn);
+		if (!camera)
+		{
+			return;
+		}
+		// GetCustomCamera() finds a pawn's camera by designer name, so a map script never gets handed this one
+		// and spawns its own instead.
+		camera->m_pEntity->m_designerName = GameEntitySystem()->AllocPooledString("kz_weapon_camera");
+		camera->SetFollowConfig(pawn, true);
+		this->weaponCamera = camera->GetRefEHandle();
+	}
+	CPlayer_CameraServices *cameraServices = pawn->m_pCameraServices();
+	if (!cameraServices)
+	{
+		return;
+	}
+	// Only take the view while nothing else holds it: a map camera or point_viewcontrol keeps priority, and
+	// the weapon is hidden again as soon as it lets go.
+	CBaseEntity *viewEntity = cameraServices->m_hViewEntity().Get();
+	if (!viewEntity || viewEntity == pawn)
+	{
+		camera->SetMode(CUSTOM_CAMERA_MODE_FOLLOW_POSITION);
+	}
+}
+
+void KZQuietService::ReleaseWeaponCamera()
+{
+	// Null on server exit.
+	if (CCSCustomPlayerCamera *camera = GameEntitySystem() ? static_cast<CCSCustomPlayerCamera *>(this->weaponCamera.Get()) : nullptr)
+	{
+		// Only clears the view entity while it is still this camera.
+		camera->SetMode(CUSTOM_CAMERA_MODE_DISABLED);
+		g_pKZUtils->RemoveEntity(camera);
+	}
+	this->weaponCamera.Term();
+}
+
+void KZQuietService::Cleanup()
+{
+	for (KZPlayer *player : g_pKZPlayerManager->GetAllSlots())
+	{
+		if (player->quietService)
+		{
+			player->quietService->ReleaseWeaponCamera();
+		}
+	}
+}
+
+void KZQuietService::ApplyPreferences()
+{
+	auto *opts = this->player->optionService;
+	const bool newHideOthers = opts->GetPreferenceBool("hideOtherPlayers", false);
+	const bool changed = newHideOthers != this->hideOtherPlayers;
+	this->hideWeapon = opts->GetPreferenceBool("hideWeapon", false);
+	this->hideOtherPlayers = newHideOthers;
+
+	if (changed)
+	{
+		this->SendFullUpdate();
+	}
+}
+
+void KZQuietService::ToggleHide()
+{
+	auto *opts = this->player->optionService;
+	opts->SetPreferenceBool("hideOtherPlayers", !opts->GetPreferenceBool("hideOtherPlayers", false));
+}
+
+void KZQuietService::UpdateHideState()
+{
+	CCSPlayerPawn *pawn = this->player->GetController()->m_hPawn();
+	CPlayer_ObserverServices *obsServices = nullptr;
+	if (pawn)
+	{
+		obsServices = pawn->m_pObserverServices;
+	}
+	if (!obsServices)
+	{
+		this->lastObserverMode = OBS_MODE_NONE;
+		this->lastObserverTarget.Term();
+		return;
+	}
+	// Nuclear option, define this if things crash still!
+#if 0
+	if (obsServices->m_iObserverMode() != this->lastObserverMode || obsServices->m_hObserverTarget() != this->lastObserverTarget)
+	{
+		this->SendFullUpdate();
+	}
+#endif
+	this->lastObserverMode = obsServices->m_iObserverMode();
+	this->lastObserverTarget = obsServices->m_hObserverTarget();
+}

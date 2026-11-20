@@ -1,0 +1,156 @@
+#include "kz/pistol/kz_pistol.h"
+#include "kz/option/kz_option.h"
+#include "kz/language/kz_language.h"
+
+#include "utils/simplecmds.h"
+#include "icvar.h"
+#include "sdk/cskeletoninstance.h"
+
+static_global class : public KZOptionServiceEventListener
+{
+	void OnPlayerPreferencesLoaded(KZPlayer *player) override
+	{
+		player->pistolService->ApplyPreferences();
+	}
+
+	void OnPlayerPreferenceChanged(KZPlayer *player, const char *optionName) override
+	{
+		if (KZ_STREQI(optionName, "preferredPistol"))
+		{
+			player->pistolService->ApplyPreferences();
+		}
+	}
+} optionEventListener;
+
+void KZPistolService::ApplyPreferences()
+{
+	this->preferredPistol =
+		KZPistolService::GetPistolIndexByName(this->player->optionService->GetPreferenceStr("preferredPistol", "weapon_usp_silencer"));
+	this->UpdatePistol();
+}
+
+void KZPistolService::Init()
+{
+	KZOptionService::RegisterEventListener(&optionEventListener);
+}
+
+SCMD(kz_pistol, SCFL_PREFERENCE | SCFL_MISC | SCFL_PLAYER)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	if (args->ArgC() < 2)
+	{
+		player->languageService->PrintChat(true, false, "Pistol Command Usage");
+		return true;
+	}
+	const char *weapon = args->ArgS();
+	i16 pistolIndex = KZPistolService::GetPistolIndexByName(weapon);
+	if (pistolIndex == -1)
+	{
+		player->languageService->PrintChat(true, false, "Pistol Unknown", weapon);
+		return true;
+	}
+	player->pistolService->preferredPistol = pistolIndex;
+	player->pistolService->UpdatePistol();
+	player->optionService->SetPreferenceStr("preferredPistol", KZPistolService::pistols[pistolIndex].className);
+	if (pistolIndex == 0)
+	{
+		player->languageService->PrintChat(true, false, "Pistol Disabled");
+		return true;
+	}
+	player->languageService->PrintChat(true, false, "Pistol Changed", KZPistolService::pistols[pistolIndex].name);
+	return true;
+}
+
+void KZPistolService::UpdatePistol()
+{
+	if (!player->IsAlive() || !player->IsInGame())
+	{
+		return;
+	}
+	if (preferredPistol == 0)
+	{
+		if (this->NeedWeaponStripping())
+		{
+			this->player->GetPlayerPawn()->m_pItemServices()->RemoveAllItems(false);
+			auto weapon = this->player->GetPlayerPawn()->m_pItemServices()->GiveNamedItem(
+				this->player->GetController()->m_iTeamNum() == CS_TEAM_CT ? "weapon_knife" : "weapon_knife_t");
+		}
+		return;
+	}
+
+	// if another plugin modifies weapons they may be in a bad state
+	// just force remove everything and always regive weapons
+	this->player->GetPlayerPawn()->m_pItemServices()->RemoveAllItems(false);
+
+	const PistolInfo_t &pistol = pistols[preferredPistol];
+	i32 originalTeam = player->GetController()->m_iTeamNum();
+	i32 otherTeam = originalTeam == CS_TEAM_CT ? CS_TEAM_T : CS_TEAM_CT;
+	bool switchTeam = false;
+	if (pistol.team == CS_TEAM_CT && originalTeam == CS_TEAM_T)
+	{
+		switchTeam = true;
+	}
+	else if (pistol.team == CS_TEAM_T && originalTeam == CS_TEAM_CT)
+	{
+		switchTeam = true;
+	}
+	else if (pistol.team == CS_TEAM_NONE && !this->player->IsFakeClient())
+	{
+		// Check the player's inventory. If there's a skin on this current team, don't switch. Otherwise, switch team.
+		bool checkOtherTeam = true;
+		CCSPlayerInventory *inventory = this->player->GetController()->m_pInventoryServices()->GetInventory();
+		// LOADOUT_POSITION_SECONDARY0 to LOADOUT_POSITION_SECONDARY5
+		for (i32 i = 2; i <= 7; i++)
+		{
+			if (inventory->m_loadoutItems[originalTeam][i].definitionIndex == pistol.itemDef
+				&& inventory->m_loadoutItems[originalTeam][i].itemID != 0)
+			{
+				checkOtherTeam = false;
+				break;
+			}
+		}
+		if (checkOtherTeam)
+		{
+			for (i32 i = 2; i <= 7; i++)
+			{
+				if (inventory->m_loadoutItems[otherTeam][i].definitionIndex == pistol.itemDef && inventory->m_loadoutItems[otherTeam][i].itemID != 0)
+				{
+					switchTeam = true;
+					break;
+				}
+			}
+		}
+	}
+	auto knife = this->player->GetPlayerPawn()->m_pItemServices()->GiveNamedItem(
+		this->player->GetController()->m_iTeamNum == CS_TEAM_CT ? "weapon_knife" : "weapon_knife_t");
+	if (switchTeam)
+	{
+		player->GetPlayerPawn()->m_iTeamNum(otherTeam);
+	}
+	auto weapon = this->player->GetPlayerPawn()->m_pItemServices()->GiveNamedItem(pistol.className);
+
+	if (switchTeam)
+	{
+		player->GetPlayerPawn()->m_iTeamNum(originalTeam);
+	}
+}
+
+bool KZPistolService::NeedWeaponStripping()
+{
+	if (!player->IsAlive() || !player->IsInGame())
+	{
+		return false;
+	}
+
+	auto weapons = player->GetPlayerPawn()->m_pWeaponServices()->m_hMyWeapons();
+	FOR_EACH_VEC(*weapons, i)
+	{
+		CBaseModelEntity *weapon = (*weapons)[i].Get();
+		if (weapon && (KZ_STREQI(weapon->GetClassname(), "weapon_knife") || KZ_STREQI(weapon->GetClassname(), "weapon_knife_t")))
+		{
+			continue;
+		}
+		return true;
+	}
+	return false;
+}

@@ -1,0 +1,172 @@
+#include "kz/hud/layout/layout.h"
+#include "kz/option/kz_option.h"
+#include "kz/option/menu/tables.h"
+#include "sdk/entity/ccscustomhudlayout.h"
+#include "utils/utils.h"
+
+#include "tier0/memdbgon.h"
+
+// === Writing classes onto the layout (global) =================================
+
+// Indexed by MHUDAlign.
+static_global const char *const ALIGN_CLASSES[] = {"align-left", NULL, "align-right"};
+
+void KZHUDService::SetLayoutClass(CCSCustomHudLayout *layout, const char *panelId, const char *&cache, const char *className)
+{
+	KZ::ui::SetSwapClass(layout, panelId, cache, className);
+}
+
+void KZHUDService::SetLayoutValueClass(CCSCustomHudLayout *layout, const char *panelId, i32 &cache, i32 value, const char *prefix, bool percent)
+{
+	value = percent ? panorama::SnapToStep(value, -100, 100) : panorama::SnapToStep(value, 0, 500);
+	if (cache == value)
+	{
+		return;
+	}
+	const char *unit = percent ? "pct" : "px";
+	char className[64];
+	if (cache != INT_MIN)
+	{
+		V_snprintf(className, sizeof(className), "%s--%s%i%s", prefix, cache < 0 ? "neg" : "", abs(cache), unit);
+		layout->SetHasClass(panelId, className, k_eHudPanelClassStatus_DoesNotHaveClass);
+	}
+	V_snprintf(className, sizeof(className), "%s--%s%i%s", prefix, value < 0 ? "neg" : "", abs(value), unit);
+	layout->SetHasClass(panelId, className, k_eHudPanelClassStatus_HasClass);
+	cache = value;
+}
+
+void KZHUDService::SetLayoutPosition(CCSCustomHudLayout *layout, const char *panelId, const char *posPanelId, i32 &coarseCache, i32 &fineCache,
+									 i32 tenths, const char *axis)
+{
+	tenths = Clamp(tenths, -1000, 1000);
+	const i32 coarse = tenths >= 0 ? tenths / 10 : -((-tenths + 9) / 10);
+	const i32 fine = tenths - coarse * 10;
+	this->SetLayoutValueClass(layout, panelId, coarseCache, coarse, axis, true);
+	if (fineCache == fine)
+	{
+		return;
+	}
+	char className[16];
+	if (fineCache != INT_MIN)
+	{
+		V_snprintf(className, sizeof(className), "f%s--%i", axis, fineCache);
+		layout->SetHasClass(posPanelId, className, k_eHudPanelClassStatus_DoesNotHaveClass);
+	}
+	V_snprintf(className, sizeof(className), "f%s--%i", axis, fine);
+	layout->SetHasClass(posPanelId, className, k_eHudPanelClassStatus_HasClass);
+	fineCache = fine;
+}
+
+void KZHUDService::UpdateLayoutElement(CCSCustomHudLayout *layout, MHUDElement element, bool show, const char *text, const Color &color, bool force)
+{
+	const MHUDElementDef &def = MHUD_ELEMENTS[(i32)element];
+	LayoutElementState &state = this->layoutElements[(i32)element];
+
+	if (force)
+	{
+		state = LayoutElementState();
+	}
+
+	if (state.hidden != !show)
+	{
+		state.hidden = !show;
+		layout->SetHasClass(def.panelId, "hidden", state.hidden ? k_eHudPanelClassStatus_HasClass : k_eHudPanelClassStatus_DoesNotHaveClass);
+	}
+	// A hidden element keeps its last values, so toggling it back on costs nothing.
+	if (state.hidden)
+	{
+		return;
+	}
+
+	// NULL means the caller had nothing to read: hold the last value instead of blanking it.
+	if (text && state.text != text)
+	{
+		state.text = text;
+		layout->SetDialogVariableString(def.panelId, def.varName, text);
+	}
+
+	const MHUDPrefs::Element &cached = this->GetPrefs().elements[(i32)element];
+	// Edge alignment measures x from the screen edge; shift it so the stored x stays the anchor.
+	const i32 alignShift = cached.align == MHUDAlign::Left ? 500 : (cached.align == MHUDAlign::Right ? -500 : 0);
+	// Top anchoring measures y from the top of the screen in the same way.
+	const i32 anchorShift = IsMHUDElementTopAnchored(element) ? 500 : 0;
+	const bool dragged = this->edit.mode == EditMode::Dragging && this->edit.element == element;
+	const f32 x = dragged ? this->edit.dragX : cached.x;
+	const f32 y = dragged ? this->edit.dragY : cached.y;
+	this->SetLayoutClass(layout, def.panelId, state.alignClass, ALIGN_CLASSES[(i32)cached.align]);
+	this->SetLayoutPosition(layout, def.panelId, def.posPanelId, state.x, state.fineX, RoundFloatToInt(x * 10.0f) + alignShift, "x");
+	this->SetLayoutPosition(layout, def.panelId, def.posPanelId, state.y, state.fineY, RoundFloatToInt(y * 10.0f) + anchorShift, "y");
+	// The jumpstats, course and race panels scale as a whole instead, from their own update.
+	if (!IsMHUDElementScaled(element))
+	{
+		this->SetLayoutValueClass(layout, def.panelId, state.fontSize, (i32)this->GetLayoutSize(element), "font-size", false);
+	}
+	const u32 packed = ((u32)color.r() << 24) | ((u32)color.g() << 16) | ((u32)color.b() << 8) | (u32)color.a();
+	if (!state.colorComputed || state.lastColorPacked != packed)
+	{
+		state.colorComputed = true;
+		state.lastColorPacked = packed;
+		state.colorClassComputed = panorama::ResolveColorClass(color);
+	}
+	this->SetLayoutClass(layout, def.panelId, state.colorClass, state.colorClassComputed);
+	this->SetLayoutClass(layout, def.panelId, state.fontClass, KZHUDService::GetMHUDFontClass(this->player, element));
+
+	// A panel's opacity fades only its text, and its background has its own.
+	const i32 opacity = Clamp(cached.opacity, 0, 100);
+	if (GetMHUDBackgroundOpacityKey(element))
+	{
+		this->SetLayoutValueClass(layout, def.panelId, state.opacity, opacity, "js-fg", true);
+		this->SetLayoutValueClass(layout, def.panelId, state.bgOpacity, Clamp(cached.bgOpacity, 0, 100), "js-bg", true);
+	}
+	else
+	{
+		this->SetLayoutValueClass(layout, def.panelId, state.opacity, opacity, "opacity", true);
+	}
+
+	// text-shadow only draws on text, so the keys Panel gets none; UpdateKeysElement outlines its glyphs.
+	const bool outline = this->IsMHUDOutlineEnabled(element) && element != MHUDElement::Keys;
+	if (state.outline != outline)
+	{
+		state.outline = outline;
+		layout->SetHasClass(def.panelId, "outline", outline ? k_eHudPanelClassStatus_HasClass : k_eHudPanelClassStatus_DoesNotHaveClass);
+	}
+}
+
+CCSCustomHudLayout *KZHUDService::EnsureOwnedLayout(bool &created)
+{
+	created = false;
+	if (!KZHUDService::IsLayoutHudAvailable())
+	{
+		return NULL;
+	}
+	return this->ownedLayout.Ensure(created);
+}
+
+void KZHUDService::DestroyOwnedLayout()
+{
+	this->AbortHudEdit();
+	this->ownedLayout.Destroy();
+	// Cleared here so a stale cache never survives a destroy without a matching entity.
+	for (i32 i = 0; i < (i32)MHUDElement::Count; i++)
+	{
+		this->layoutElements[i] = LayoutElementState();
+	}
+	this->layoutKeys = LayoutKeysState();
+	this->layoutJumpstats = LayoutJumpstatsState();
+	this->layoutCourse = LayoutCourseState();
+	this->layoutRace = LayoutRaceState();
+	this->releaseText.clear();
+	this->layoutEdit = LayoutEditState();
+}
+
+void KZHUDService::Cleanup()
+{
+	for (KZPlayer *player : g_pKZPlayerManager->GetAllSlots())
+	{
+		if (player->hudService)
+		{
+			player->hudService->DestroyOwnedLayout();
+			player->hudService->RestoreGameHud();
+		}
+	}
+}

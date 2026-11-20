@@ -1,0 +1,125 @@
+#pragma once
+
+#undef snprintf
+#include <steam/steam_gameserver.h>
+
+#include <functional>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "common.h"
+
+namespace HTTP
+{
+	class Response;
+	class InFlightRequest;
+
+	typedef std::unordered_map<std::string, std::string> HeaderMap;
+	typedef std::unordered_map<std::string, std::string> QueryParameters;
+	typedef std::function<void(Response)> ResponseCallback;
+	typedef std::function<void()> ErrorCallback;
+
+	extern std::vector<InFlightRequest *> g_InFlightRequests;
+	extern ISteamHTTP *g_pHTTP;
+
+	// Drops every outstanding request. Call on plugin unload, before the callbacks can be unmapped.
+	void Cleanup();
+
+	// HTTP methods we care about.
+	enum class Method
+	{
+		GET,
+		POST,
+		PUT,
+		PATCH,
+	};
+
+	// An HTTP request.
+	class Request
+	{
+	public:
+		Request(Method method, std::string url) : method(method), url(url) {}
+
+		// Set a query parameter.
+		void SetQuery(std::string key, std::string value);
+
+		// Set a header.
+		void SetHeader(std::string name, std::string value);
+
+		// Set the request body. Only JSON bodies are printed by the debug log.
+		void SetBody(std::string body, std::string contentType = "application/json");
+
+		// Send the request.
+		void Send(ResponseCallback onResponse, ErrorCallback onError = nullptr) const;
+
+	private:
+		const Method method;
+		std::string url {};
+		bool hasQueryParams {};
+		HeaderMap headers {};
+		std::string body {};
+		std::string contentType = "application/json";
+	};
+
+	// An HTTP response.
+	class Response
+	{
+	public:
+		const u16 status;
+
+		Response(u16 status, HTTPRequestHandle requestHandle) : status(status), requestHandle(requestHandle) {}
+
+		// Retrieves a header if it exists.
+		std::optional<std::string> Header(const char *name) const;
+
+		// Extracts the body if it exists.
+		std::optional<std::string> Body() const;
+
+		// Extracts the body if it exists.
+		std::optional<std::vector<char>> RawBody() const;
+
+	private:
+		HTTPRequestHandle requestHandle;
+	};
+
+	class InFlightRequest
+	{
+	public:
+		InFlightRequest(const InFlightRequest &req) = delete;
+
+		InFlightRequest(HTTPRequestHandle handle, SteamAPICall_t steamCallHandle, std::string url, ResponseCallback onResponse, ErrorCallback onError)
+			: url(url), handle(handle), onResponse(onResponse), onError(onError)
+		{
+			callResult.SetGameserverFlag();
+			callResult.Set(steamCallHandle, this, &InFlightRequest::OnRequestCompleted);
+			g_InFlightRequests.push_back(this);
+		}
+
+		~InFlightRequest()
+		{
+			for (auto req = g_InFlightRequests.begin(); req != g_InFlightRequests.end(); req++)
+			{
+				if (*req == this)
+				{
+					g_InFlightRequests.erase(req);
+					break;
+				}
+			}
+			if (g_pHTTP && handle != INVALID_HTTPREQUEST_HANDLE)
+			{
+				g_pHTTP->ReleaseHTTPRequest(handle);
+			}
+		}
+
+	private:
+		std::string url;
+		HTTPRequestHandle handle;
+		CCallResult<InFlightRequest, HTTPRequestCompleted_t> callResult;
+		ResponseCallback onResponse;
+		ErrorCallback onError;
+
+		void OnRequestCompleted(HTTPRequestCompleted_t *completedRequest, bool failed);
+	};
+} // namespace HTTP

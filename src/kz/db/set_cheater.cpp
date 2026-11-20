@@ -1,0 +1,120 @@
+#include "kz/db/kz_db.h"
+#include "queries/players.h"
+#include "queries/bans.h"
+#include "utils/uuid.h"
+
+#include <vendor/sql_mm/src/public/sql_mm.h>
+
+static_function void InsertBan(Transaction &txn, u64 steamID64, const char *reason, const char *endTime, const UUID_t &banId,
+							   const UUID_t &replayUuid)
+{
+	char query[2048];
+	const UUID_t &useId = (banId == UUID_t(false)) ? UUID_t() : banId;
+	std::string banIdStr = useId.ToString();
+	std::string escapedReason = KZDatabaseService::GetDatabaseConnection()->Escape(reason ? reason : "No reason provided");
+	std::string replayUuidStr = replayUuid == UUID_t(false) ? "NULL" : ("'" + replayUuid.ToString() + "'");
+
+	const char *insertQuery = KZDatabaseService::GetDatabaseType() == KZ::Database::DatabaseType::MySQL ? mysql_bans_insert : sqlite_bans_insert;
+	V_snprintf(query, sizeof(query), insertQuery, banIdStr.c_str(), steamID64, escapedReason.c_str(), replayUuidStr.c_str(), endTime);
+	txn.queries.push_back(query);
+}
+
+void KZDatabaseService::Ban(u64 steamID64, const char *reason, f32 duration, const UUID_t banId, const UUID_t replayUuid,
+							TransactionSuccessCallbackFunc onSuccess, TransactionFailureCallbackFunc onFailure)
+{
+	if (!KZDatabaseService::IsReady())
+	{
+		onFailure("Database not ready", -1);
+		return;
+	}
+
+	char expiryValue[128];
+	if (duration < 0.0f)
+	{
+		// No actual ban duration (e.g. a plain kick), but still record a 0 second (already expired) ban for audit purposes.
+		if (GetDatabaseType() == KZ::Database::DatabaseType::MySQL)
+		{
+			V_snprintf(expiryValue, sizeof(expiryValue), "CURRENT_TIMESTAMP");
+		}
+		else
+		{
+			V_snprintf(expiryValue, sizeof(expiryValue), "datetime('now')");
+		}
+	}
+	else if (duration > 0.0f)
+	{
+		// Temporary ban with specific duration in seconds
+		if (GetDatabaseType() == KZ::Database::DatabaseType::MySQL)
+		{
+			V_snprintf(expiryValue, sizeof(expiryValue), "DATE_ADD(CURRENT_TIMESTAMP, INTERVAL %.0f SECOND)", duration);
+		}
+		else
+		{
+			V_snprintf(expiryValue, sizeof(expiryValue), "datetime('now', '+%.0f seconds')", duration);
+		}
+	}
+	else
+	{
+		// Permanent ban set to far future date
+		V_snprintf(expiryValue, sizeof(expiryValue), "'9999-12-31 23:59:59'");
+	}
+
+	char query[2048];
+	Transaction txn;
+
+	// Only replace active bans that end sooner, a new infraction should never shorten an existing ban.
+	V_snprintf(query, sizeof(query), sql_bans_remove_active_before, steamID64, expiryValue);
+	txn.queries.push_back(query);
+
+	InsertBan(txn, steamID64, reason, expiryValue, banId, replayUuid);
+
+	GetDatabaseConnection()->ExecuteTransaction(txn, onSuccess, onFailure);
+}
+
+void KZDatabaseService::AddOrUpdateBan(u64 steamID64, const char *reason, const char *endTime, const UUID_t banId, const UUID_t replayUuid,
+									   TransactionSuccessCallbackFunc onSuccess, TransactionFailureCallbackFunc onFailure)
+{
+	if (!KZDatabaseService::IsReady())
+	{
+		onFailure("Database not ready", -1);
+		return;
+	}
+	char query[2048];
+
+	Transaction txn;
+
+	// Set other active bans to expire now
+	V_snprintf(query, sizeof(query), sql_bans_remove_active, steamID64);
+	txn.queries.push_back(query);
+
+	// Insert or update a new ban record with specific end time
+	InsertBan(txn, steamID64, reason, endTime, banId, replayUuid);
+
+	GetDatabaseConnection()->ExecuteTransaction(txn, onSuccess, onFailure);
+}
+
+void KZDatabaseService::Unban(u64 steamID64)
+{
+	if (!KZDatabaseService::IsReady())
+	{
+		return;
+	}
+
+	char query[2048];
+	Transaction txn;
+
+	// Set active bans to expire now
+	V_snprintf(query, sizeof(query), sql_bans_remove_active, steamID64);
+	txn.queries.push_back(query);
+
+	// clang-format off
+	GetDatabaseConnection()->ExecuteTransaction(
+		txn,
+		[steamID64](std::vector<ISQLQuery *> queries)
+		{
+			KZ_LOG_INFO(LogChannel::DB, "Player (%llu) has been unbanned.\n", steamID64);
+		},
+		OnGenericTxnFailure
+	);
+	// clang-format on
+}

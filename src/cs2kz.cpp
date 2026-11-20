@@ -1,0 +1,283 @@
+#include "cs2kz.h"
+
+#include "entity2/entitysystem.h"
+#include "steam/steam_gameserver.h"
+
+#include "utils/utils.h"
+#include "utils/addresses.h"
+#include "utils/hooks.h"
+#include "utils/gameconfig.h"
+#include "utils/async_file_io.h"
+#include "utils/ctimer.h"
+#include "utils/http.h"
+
+#include "movement/movement.h"
+#include "kz/kz.h"
+#include "kz/away/kz_away.h"
+#include "kz/option/menu/kz_menu.h"
+#include "kz/ui/kz_ui.h"
+#include "kz/anticheat/kz_anticheat.h"
+#include "kz/db/kz_db.h"
+#include "kz/hud/kz_hud.h"
+#include "kz/progress/kz_progress.h"
+#include "kz/mode/kz_mode.h"
+#include "kz/spec/kz_spec.h"
+#include "kz/goto/kz_goto.h"
+#include "kz/style/kz_style.h"
+#include "kz/quiet/kz_quiet.h"
+#include "kz/ztopwatch/kz_ztopwatch.h"
+#include "kz/tip/kz_tip.h"
+#include "kz/jumpstats/kz_jumpstats.h"
+#include "kz/paint/kz_paint.h"
+#include "kz/option/kz_option.h"
+#include "kz/option/pref_registry.h"
+#include "kz/language/kz_language.h"
+#include "kz/mappingapi/kz_mappingapi.h"
+#include "kz/global/kz_global.h"
+#include "kz/beam/kz_beam.h"
+#include "kz/pistol/kz_pistol.h"
+#include "kz/recording/kz_recording.h"
+#include "kz/replays/kz_replaysystem.h"
+#include "kz/racing/kz_racing.h"
+#include "kz/pubapi/kz_pubapi.h"
+
+#include <vendor/MultiAddonManager/public/imultiaddonmanager.h>
+#include <vendor/ixwebsocket/ixwebsocket/IXNetSystem.h>
+#include <vendor/mm-utils/interfaces/cs2menus/ics2menus.h>
+
+#include "tier0/memdbgon.h"
+KZPlugin g_KZPlugin;
+
+IMultiAddonManager *g_pMultiAddonManager;
+ICS2Menus *g_pMenus;
+
+PLUGIN_EXPOSE(KZPlugin, g_KZPlugin);
+
+bool KZPlugin::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool late)
+{
+	setlocale(LC_ALL, "en_US.utf8");
+	PLUGIN_SAVEVARS();
+	modules::Initialize();
+
+	if (!interfaces::Initialize(ismm, error, maxlen))
+	{
+		modules::Cleanup();
+		return false;
+	}
+
+	// Metamod keeps the binary loaded after a failed load and reuses it on the next "meta load", so every step that can fail
+	// runs before anything that can't be undone.
+	RegisterKZLogChannels();
+	if (!utils::Initialize(ismm, error, maxlen) || !hooks::ResolveSignatures(error, maxlen))
+	{
+		utils::Cleanup();
+		return false;
+	}
+
+	// The convars can't be registered twice in one binary, Metamod unregisters them for good once the load fails.
+	META_CONVAR_REGISTER(FCVAR_NONE);
+	if (!KZ::mode::CheckModeCvars())
+	{
+		snprintf(error, maxlen, "Failed to find one or more mode cvars.");
+		utils::Cleanup();
+		return false;
+	}
+
+	KZOptionService::InitOptions();
+	InitKZLogging();
+	kz_log_to_file.Set((bool)KZOptionService::GetOptionInt("logToFile", true));
+
+	hooks::Initialize();
+	ix::initNetSystem();
+
+	KZ::misc::Init();
+	KZCheckpointService::Init();
+	KZTimerService::Init();
+	KZSpecService::Init();
+	KZGotoService::Init();
+	KZHUDService::Init();
+	KZProgressService::Init();
+	KZMenuService::Init();
+	KZLanguageService::Init();
+	KZBeamService::Init();
+	KZPistolService::Init();
+	KZPaintService::Init();
+	KZJumpstatsService::Init();
+	KZQuietService::Init();
+	KZZtopwatchService::Init();
+	KZ::prefs::Init();
+	AsyncFileIO::Init();
+	KZRecordingService::Init();
+	// Must come after KZTimerService::Init, it hooks into the timer's event listeners.
+	KZ::pubapi::Init();
+
+	ismm->AddListener(this, this);
+	KZ::mapapi::Init();
+	KZ::mode::InitModeManager();
+	KZ::style::InitStyleManager();
+
+	KZ::mode::DisableReplicatedModeCvars();
+
+	KZTipService::Init();
+	KZAnticheatService::Init();
+	if (late)
+	{
+		g_pKZPlayerManager->OnLateLoad();
+		// We need to reset the map for mapping api to properly load in.
+		utils::ResetMap();
+		KZ::replaysystem::Init();
+	}
+
+	// We don't need command filtering for KZ maps.
+	CommandLine()->AppendParm("-disable_workshop_command_filtering", "");
+	KZ_LOG_DEBUG(LogChannel::General, "Plugin loaded successfully. (late load: %s)", late ? "true" : "false");
+	KZ::replaysystem::InitWatcher();
+	loading = false;
+	return true;
+}
+
+bool KZPlugin::Unload(char *error, size_t maxlen)
+{
+	// Metamod still calls Unload after a failed load (shutdown, meta unload), Load already undid its own setup.
+	if (this->loading)
+	{
+		return true;
+	}
+	this->unloading = true;
+	KZAwayService::Shutdown();
+	KZUIService::Cleanup();
+	KZProgressService::Cleanup();
+	KZHUDService::Cleanup();
+	KZQuietService::Cleanup();
+	KZ::pubapi::Shutdown();
+	KZ::misc::UnrestrictTimeLimit();
+	KZRecordingService::Shutdown();
+	AsyncFileIO::Cleanup();
+	KZRacingService::Cleanup();
+	KZ::mode::EnableReplicatedModeCvars();
+	g_pKZModeManager->Cleanup();
+	g_pKZStyleManager->Cleanup();
+	g_pPlayerManager->Cleanup();
+	KZDatabaseService::Cleanup();
+	KZGlobalService::Cleanup();
+	KZLanguageService::Cleanup();
+	KZOptionService::Cleanup();
+	KZ::replaysystem::Cleanup();
+	KZAnticheatService::CleanupSvCheatsWatcher();
+	KZWebSocket::Cleanup();
+	hooks::Cleanup();
+	HTTP::Cleanup();
+	RemoveAllTimers();
+	utils::Cleanup();
+	LoggingSystem_UnregisterLoggingListener(&g_KZLoggingListener);
+	kz_log_to_file.Set(false);
+	g_KZLoggingListener.CheckFile();
+	ConVar_Unregister();
+	// The heap-allocated CConVarRefs are in the SDK's registration list until ConVar_Unregister() walks it, so they must outlive it.
+	// Not in KZGlobalService::Cleanup(): ReloadConfig() calls that at runtime and keeps using the refs.
+	KZGlobalService::CleanupConVars();
+	KZ::mode::CleanupModeCvarRefs();
+	return true;
+}
+
+void KZPlugin::AllPluginsLoaded()
+{
+	KZDatabaseService::Init();
+	KZ::mode::LoadModePlugins();
+	KZ::style::LoadStylePlugins();
+	g_pKZPlayerManager->ResetPlayers();
+	this->UpdateSelfMD5();
+	g_pMultiAddonManager = (IMultiAddonManager *)g_SMAPI->MetaFactory(MULTIADDONMANAGER_INTERFACE, nullptr, nullptr);
+	g_pMenus = (ICS2Menus *)g_SMAPI->MetaFactory(CS2MENUS_INTERFACE, nullptr, nullptr);
+}
+
+void KZPlugin::OnPluginLoad(PluginId id)
+{
+	g_pMultiAddonManager = (IMultiAddonManager *)g_SMAPI->MetaFactory(MULTIADDONMANAGER_INTERFACE, nullptr, nullptr);
+	g_pMenus = (ICS2Menus *)g_SMAPI->MetaFactory(CS2MENUS_INTERFACE, nullptr, nullptr);
+}
+
+void KZPlugin::OnPluginUnload(PluginId id)
+{
+	g_pMultiAddonManager = (IMultiAddonManager *)g_SMAPI->MetaFactory(MULTIADDONMANAGER_INTERFACE, nullptr, nullptr);
+	g_pMenus = (ICS2Menus *)g_SMAPI->MetaFactory(CS2MENUS_INTERFACE, nullptr, nullptr);
+}
+
+void KZPlugin::OnLevelInit(char const *pMapName, char const *pMapEntities, char const *pOldLevel, char const *pLandmarkName, bool loadGame,
+						   bool background)
+{
+	KZProgressService::OnMapChange();
+	m_sCurrentMap = pMapName;
+}
+
+void KZPlugin::AddonInit()
+{
+	static_persist bool addonLoaded;
+	if (g_pMultiAddonManager != nullptr && !addonLoaded)
+	{
+		addonLoaded = g_pMultiAddonManager->AddAddon(KZLanguageService::GetBaseAddon(), true);
+		CConVarRef<bool> mm_cache_clients_with_addons("mm_cache_clients_with_addons");
+		CConVarRef<float> mm_cache_clients_duration("mm_cache_clients_duration");
+		mm_cache_clients_with_addons.Set(true);
+		mm_cache_clients_duration.Set(30.0f);
+	}
+}
+
+bool KZPlugin::IsAddonMounted()
+{
+	if (g_pMultiAddonManager != nullptr)
+	{
+		return g_pMultiAddonManager->IsAddonMounted(KZLanguageService::GetBaseAddon(), true);
+	}
+	return false;
+}
+
+bool KZPlugin::Pause(char *error, size_t maxlen)
+{
+	return true;
+}
+
+bool KZPlugin::Unpause(char *error, size_t maxlen)
+{
+	return true;
+}
+
+void *KZPlugin::OnMetamodQuery(const char *iface, int *ret)
+{
+	if (strcmp(iface, KZ_MODE_MANAGER_INTERFACE) == 0)
+	{
+		*ret = META_IFACE_OK;
+		return g_pKZModeManager;
+	}
+	else if (strcmp(iface, KZ_STYLE_MANAGER_INTERFACE) == 0)
+	{
+		*ret = META_IFACE_OK;
+		return g_pKZStyleManager;
+	}
+	else if (strcmp(iface, KZ_UTILS_INTERFACE) == 0)
+	{
+		*ret = META_IFACE_OK;
+		return g_pKZUtils;
+	}
+	else if (strcmp(iface, KZ_MAPPING_INTERFACE) == 0)
+	{
+		*ret = META_IFACE_OK;
+		return g_pMappingApi;
+	}
+	else if (strcmp(iface, CS2KZ_INTERFACE) == 0)
+	{
+		*ret = META_IFACE_OK;
+		return KZ::pubapi::GetAPI();
+	}
+	*ret = META_IFACE_FAILED;
+
+	return NULL;
+}
+
+void KZPlugin::UpdateSelfMD5()
+{
+	ISmmPluginManager *pluginManager = (ISmmPluginManager *)g_SMAPI->MetaFactory(MMIFACE_PLMANAGER, nullptr, nullptr);
+	const char *path;
+	pluginManager->Query(g_PLID, &path, nullptr, nullptr);
+	g_pKZUtils->GetFileMD5(path, this->md5, sizeof(this->md5));
+}

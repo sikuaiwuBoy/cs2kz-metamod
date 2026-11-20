@@ -1,0 +1,1795 @@
+#include "kz_timer.h"
+#include "kz/db/kz_db.h"
+#include "kz/global/kz_global.h"
+#include "kz/language/kz_language.h"
+#include "kz/mode/kz_mode.h"
+#include "kz/style/kz_style.h"
+#include "kz/noclip/kz_noclip.h"
+#include "kz/option/kz_option.h"
+#include "kz/trigger/kz_trigger.h"
+#include "kz/spec/kz_spec.h"
+#include "kz/recording/kz_recording.h"
+#include "kz/hud/kz_hud.h"
+#include "kz/away/kz_away.h"
+#include "submission.h"
+
+#include "utils/utils.h"
+#include "utils/simplecmds.h"
+#include "vendor/sql_mm/src/public/sql_mm.h"
+#include <algorithm>
+
+// clang-format off
+constexpr const char *diffTextKeys[KZTimerService::CompareType::COMPARETYPE_COUNT] = {
+	"",
+	"Server PB Diff (Overall)",
+	"Global PB Diff (Overall)",
+	"SR Diff (Overall)",
+	"WR Diff (Overall)"
+};
+
+constexpr const char *diffTextKeysPro[KZTimerService::CompareType::COMPARETYPE_COUNT] = {
+	"",
+	"Server PB Diff (Pro)",
+	"Global PB Diff (Pro)",
+	"SR Diff (Pro)",
+	"WR Diff (Pro)"
+};
+
+constexpr const char *missedTimeKeys[KZTimerService::CompareType::COMPARETYPE_COUNT] = {
+	"",
+	"Missed Server PB (Overall)",
+	"Missed Global PB (Overall)",
+	"Missed SR (Overall)",
+	"Missed WR (Overall)"
+};
+
+constexpr const char *missedTimeKeysPro[KZTimerService::CompareType::COMPARETYPE_COUNT] = {
+	"",
+	"Missed Server PB (Pro)",
+	"Missed Global PB (Pro)",
+	"Missed SR (Pro)",
+	"Missed WR (Pro)"
+};
+
+constexpr const char *missedTimeKeysBoth[KZTimerService::CompareType::COMPARETYPE_COUNT] = {
+	"",
+	"Missed Server PB (Overall+Pro)",
+	"Missed Global PB (Overall+Pro)",
+	"Missed SR (Overall+Pro)",
+	"Missed WR (Overall+Pro)"
+};
+
+// clang-format on
+
+static_global class KZDatabaseServiceEventListener_Timer : public KZDatabaseServiceEventListener
+{
+public:
+	virtual void OnMapSetup() override;
+	virtual void OnClientSetup(Player *player, u64 steamID64, bool isBanned, const char *banReason) override;
+} databaseEventListener;
+
+static_global class KZOptionServiceEventListener_Timer : public KZOptionServiceEventListener
+{
+	virtual void OnPlayerPreferencesLoaded(KZPlayer *player)
+	{
+		player->timerService->ApplyPreferences();
+	}
+
+	virtual void OnPlayerPreferenceChanged(KZPlayer *player, const char *optionName)
+	{
+		if (KZ_STREQI(optionName, "preferredCompareType") || KZ_STREQI(optionName, "timerStopSound") || KZ_STREQI(optionName, "spectatePause")
+			|| KZ_STREQI(optionName, "spectateResume"))
+		{
+			player->timerService->ApplyPreferences();
+		}
+	}
+} optionEventListener;
+
+std::unordered_map<PBDataKey, PBData> KZTimerService::srCache;
+std::unordered_map<PBDataKey, PBData> KZTimerService::wrCache;
+
+static_global std::vector<KZTimerServiceEventListener *> eventListeners;
+
+bool KZTimerService::RegisterEventListener(KZTimerServiceEventListener *eventListener)
+{
+	if (std::find(eventListeners.begin(), eventListeners.end(), eventListener) != eventListeners.end())
+	{
+		return false;
+	}
+	eventListeners.push_back(eventListener);
+	return true;
+}
+
+bool KZTimerService::UnregisterEventListener(KZTimerServiceEventListener *eventListener)
+{
+	auto it = std::find(eventListeners.begin(), eventListeners.end(), eventListener);
+	if (it == eventListeners.end())
+	{
+		return false;
+	}
+	eventListeners.erase(it);
+	return true;
+}
+
+void KZTimerService::DispatchRunSubmitted(const RunSubmission &submission)
+{
+	CALL_FORWARD(eventListeners, OnRunSubmittedPost, submission);
+}
+
+void KZTimerService::StartZoneStartTouch(const KZCourseDescriptor *course)
+{
+	this->touchedGroundSinceTouchingStartZone = !!(this->player->GetPlayerPawn()->m_fFlags & FL_ONGROUND);
+	this->TimerStop(false);
+}
+
+void KZTimerService::StartZoneEndTouch(const KZCourseDescriptor *course)
+{
+	if (this->touchedGroundSinceTouchingStartZone)
+	{
+		this->TimerStart(course);
+	}
+}
+
+void KZTimerService::SplitZoneStartTouch(const KZCourseDescriptor *course, i32 splitNumber)
+{
+	if (!this->timerRunning || course->guid != this->currentCourseGUID)
+	{
+		return;
+	}
+
+	assert(splitNumber > INVALID_SPLIT_NUMBER && splitNumber <= KZ_MAX_SPLIT_ZONES);
+
+	if (this->splitZoneTimes[splitNumber - 1] < 0)
+	{
+		this->PlayReachedSplitSound();
+		this->splitZoneTimes[splitNumber - 1] = this->GetTime();
+		this->ShowSplitText(splitNumber);
+		this->lastSplit = splitNumber;
+		CALL_FORWARD(eventListeners, OnSplitZoneTouchPost, this->player, splitNumber);
+		if (this->player->optionService->GetPreferenceBool("mapOverlay"))
+		{
+			// clang-format off
+			this->player->PrintConsole(false, false, "[CS2KZ] split|%d|%f", 
+				splitNumber,
+				this->GetTime()
+			);
+			// clang-format on
+		}
+	}
+}
+
+void KZTimerService::CheckpointZoneStartTouch(const KZCourseDescriptor *course, i32 cpNumber)
+{
+	if (!this->timerRunning || course->guid != this->currentCourseGUID)
+	{
+		return;
+	}
+
+	assert(cpNumber > INVALID_CHECKPOINT_NUMBER && cpNumber <= KZ_MAX_CHECKPOINT_ZONES);
+
+	if (this->cpZoneTimes[cpNumber - 1] < 0)
+	{
+		this->PlayReachedCheckpointSound();
+		this->cpZoneTimes[cpNumber - 1] = this->GetTime();
+		this->ShowCheckpointText(cpNumber);
+		this->lastCheckpoint = cpNumber;
+		this->reachedCheckpoints++;
+		CALL_FORWARD(eventListeners, OnCheckpointZoneTouchPost, this->player, cpNumber);
+		if (this->player->optionService->GetPreferenceBool("mapOverlay"))
+		{
+			// clang-format off
+			this->player->PrintConsole(false, false, "[CS2KZ] checkpoint|%d|%f", 
+				cpNumber,
+				this->GetTime()
+			);
+			// clang-format on
+		}
+	}
+}
+
+void KZTimerService::StageZoneStartTouch(const KZCourseDescriptor *course, i32 stageNumber)
+{
+	if (!this->timerRunning || course->guid != this->currentCourseGUID)
+	{
+		return;
+	}
+
+	assert(stageNumber > INVALID_STAGE_NUMBER && stageNumber <= KZ_MAX_STAGE_ZONES);
+
+	if (stageNumber > this->currentStage + 1)
+	{
+		this->PlayMissedZoneSound();
+		this->player->languageService->PrintChat(true, false, "Touched too high stage number (Missed stage)", this->currentStage + 1);
+		return;
+	}
+
+	if (stageNumber == this->currentStage + 1)
+	{
+		this->stageZoneTimes[this->currentStage] = this->GetTime();
+		this->PlayReachedStageSound();
+		this->ShowStageText();
+		this->currentStage++;
+		CALL_FORWARD(eventListeners, OnStageZoneTouchPost, this->player, stageNumber);
+		if (this->player->optionService->GetPreferenceBool("mapOverlay"))
+		{
+			// clang-format off
+			this->player->PrintConsole(false, false, "[CS2KZ] stage|%d|%f", 
+				stageNumber,
+				this->GetTime()
+			);
+			// clang-format on
+		}
+	}
+}
+
+bool KZTimerService::TimerStart(const KZCourseDescriptor *courseDesc, bool playSound)
+{
+	// clang-format off
+	if (!this->player->GetPlayerPawn()->IsAlive()
+		|| this->JustStartedTimer()
+		|| this->player->JustTeleported()
+		|| this->player->inPerf
+		|| this->player->noclipService->JustNoclipped()
+		|| !this->HasValidMoveType()
+		|| this->JustLanded()
+		|| (this->GetTimerRunning() && courseDesc->guid == this->currentCourseGUID)
+		|| (!(this->player->GetPlayerPawn()->m_fFlags & FL_ONGROUND) && !this->GetValidJump()))
+	// clang-format on
+	{
+		return false;
+	}
+	if (V_strlen(this->player->modeService->GetModeName()) > KZ_MAX_MODE_NAME_LENGTH)
+	{
+		Warning("[KZ] Timer start failed: Mode name is too long!");
+		return false;
+	}
+
+	bool allowStart = true;
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		allowStart &= eventListeners[i]->OnTimerStart(this->player, courseDesc->guid);
+	}
+	if (!allowStart)
+	{
+		return false;
+	}
+
+	// In CKZ you can touch trigger in half tick intervals, but here we are incrementing by full tick intervals only.
+	// Since the player was still in the trigger for half a tick, we need to offset by half a tick if we started in a half tick.
+	// So the current time should be subtracted by the difference between server curtime and client curtime at the moment of starting the timer,
+	// That way when we increment by full tick intervals in OnPhysicsSimulatePost, the time will be correct.
+	this->currentTime = g_pKZUtils->GetGlobals()->curtime - g_pKZUtils->GetServerGlobals()->curtime;
+	assert(this->currentTime <= 0 && this->currentTime > -ENGINE_FIXED_TICK_INTERVAL);
+	this->timerRunning = true;
+	this->currentStage = 0;
+	this->reachedCheckpoints = 0;
+	this->lastCheckpoint = 0;
+	this->lastSplit = 0;
+
+	f64 invalidTime = -1;
+	this->splitZoneTimes.assign(courseDesc->splitCount, invalidTime);
+	this->cpZoneTimes.assign(courseDesc->checkpointCount, invalidTime);
+	this->stageZoneTimes.assign(courseDesc->stageCount, invalidTime);
+
+	// Print course change message if needed
+	if (this->currentCourseGUID != courseDesc->guid)
+	{
+		this->player->languageService->PrintChat(true, false, "Started Run on Course", courseDesc->name);
+		if (KZGlobalService::IsAvailable())
+		{
+			bool mapApproved = false;
+			bool ranked = false;
+			KZGlobalService::WithCurrentMap(
+				[&](const std::optional<KZ::api::Map> &map)
+				{
+					if (!map || map->state != KZ::api::Map::State::Approved)
+					{
+						return;
+					}
+					mapApproved = true;
+					// Styled runs are never ranked.
+					if (!this->player->styleServices.empty())
+					{
+						return;
+					}
+					for (const auto &apiCourse : map->courses)
+					{
+						if (apiCourse.id != courseDesc->globalDatabaseID)
+						{
+							continue;
+						}
+						using FilterState = KZ::api::Map::Course::Filter::State;
+						const char *modeName = this->player->modeService->GetModeName();
+						ranked = (KZ_STREQI(modeName, "Classic") && apiCourse.filters.classic.state == FilterState::Ranked)
+								 || (KZ_STREQI(modeName, "Vanilla") && apiCourse.filters.vanilla.state == FilterState::Ranked);
+						break;
+					}
+				});
+			if (!mapApproved)
+			{
+				// First run of a course on any map. Print a one-time message if the map is not global.
+				if (this->currentCourseGUID == 0)
+				{
+					this->player->languageService->PrintChat(true, false, "Non Global Map Warning");
+				}
+			}
+			else if (!ranked)
+			{
+				this->player->languageService->PrintChat(true, false, "Started Run on Non Ranked Course", courseDesc->name);
+			}
+		}
+		SetCourse(courseDesc->guid);
+	}
+
+	this->validTime = true;
+	this->shouldAnnounceMissedTime = true;
+	this->shouldAnnounceMissedProTime = true;
+
+	this->UpdateCurrentCompareType(ToPBDataKey(KZ::mode::GetModeInfo(this->player->modeService).id, courseDesc->guid));
+
+	if (playSound)
+	{
+		for (KZPlayer *spec = player->specService->GetNextSpectator(NULL); spec != NULL; spec = player->specService->GetNextSpectator(spec))
+		{
+			spec->timerService->PlayTimerStartSound();
+		}
+		this->PlayTimerStartSound();
+	}
+
+	if (!this->player->IsAuthenticated())
+	{
+		this->player->languageService->PrintChat(true, false, "No Steam Authentication Warning");
+	}
+	if (KZGlobalService::IsAvailable() && !this->player->CheckPrime())
+	{
+		this->player->languageService->PrintChat(true, false, "No Prime Warning");
+	}
+
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		eventListeners[i]->OnTimerStartPost(this->player, courseDesc->guid);
+	}
+	if (this->player->optionService->GetPreferenceBool("mapOverlay"))
+	{
+		// clang-format off
+		this->player->PrintConsole(false, false, "[CS2KZ] timer_start|%s|%d|%d|%d|%s", 
+			courseDesc->name,
+			courseDesc->splitCount,
+			courseDesc->checkpointCount,
+			courseDesc->stageCount,
+			this->player->modeService->GetModeShortName()
+		);
+		// clang-format on
+	}
+	return true;
+}
+
+bool KZTimerService::TimerEnd(const KZCourseDescriptor *courseDesc)
+{
+	if (!this->player->IsAlive())
+	{
+		return false;
+	}
+
+	if (!this->timerRunning || courseDesc->guid != this->currentCourseGUID)
+	{
+		for (KZPlayer *spec = player->specService->GetNextSpectator(NULL); spec != NULL; spec = player->specService->GetNextSpectator(spec))
+		{
+			spec->timerService->PlayTimerFalseEndSound();
+		}
+		this->PlayTimerFalseEndSound();
+		this->lastFalseEndTime = g_pKZUtils->GetServerGlobals()->curtime;
+		return false;
+	}
+
+	if (this->currentStage != courseDesc->stageCount)
+	{
+		this->PlayMissedZoneSound();
+		this->player->languageService->PrintChat(true, false, "Can't Finish Run (Missed Stage)", this->currentStage + 1);
+		return false;
+	}
+
+	if (this->reachedCheckpoints != courseDesc->checkpointCount)
+	{
+		this->PlayMissedZoneSound();
+		i32 missCount = courseDesc->checkpointCount - this->reachedCheckpoints;
+		if (missCount == 1)
+		{
+			this->player->languageService->PrintChat(true, false, "Can't Finish Run (Missed a Checkpoint Zone)");
+		}
+		else
+		{
+			this->player->languageService->PrintChat(true, false, "Can't Finish Run (Missed Checkpoint Zones)", missCount);
+		}
+		return false;
+	}
+
+	f32 time = this->GetTime() + g_pKZUtils->GetServerGlobals()->frametime;
+	u32 teleportsUsed = this->player->checkpointService->GetTeleportCount();
+
+	bool allowEnd = true;
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		allowEnd &= eventListeners[i]->OnTimerEnd(this->player, this->currentCourseGUID, time, teleportsUsed);
+	}
+	if (!allowEnd)
+	{
+		return false;
+	}
+	// Update current time for one last time.
+	this->currentTime = time;
+
+	this->timerRunning = false;
+	this->lastEndTime = g_pKZUtils->GetServerGlobals()->curtime;
+
+	for (KZPlayer *spec = player->specService->GetNextSpectator(NULL); spec != NULL; spec = player->specService->GetNextSpectator(spec))
+	{
+		spec->timerService->PlayTimerEndSound();
+	}
+	this->PlayTimerEndSound();
+
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		eventListeners[i]->OnTimerEndPost(this->player, this->currentCourseGUID, time, teleportsUsed);
+	}
+	// This must be called after OnTimerEndPost so that the run UUID is set correctly.
+	if (this->player->optionService->GetPreferenceBool("mapOverlay"))
+	{
+		this->player->PrintConsole(false, false, "[CS2KZ] timer_end");
+	}
+	if (!this->player->GetPlayerPawn()->IsBot())
+	{
+		RunSubmission::Create(this->player);
+	}
+
+	return true;
+}
+
+bool KZTimerService::TimerStop(bool playSound)
+{
+	if (!this->timerRunning)
+	{
+		return false;
+	}
+	this->timerRunning = false;
+	if (playSound)
+	{
+		for (KZPlayer *spec = player->specService->GetNextSpectator(NULL); spec != NULL; spec = player->specService->GetNextSpectator(spec))
+		{
+			spec->timerService->PlayTimerStopSound();
+		}
+		this->PlayTimerStopSound();
+	}
+
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		eventListeners[i]->OnTimerStopped(this->player, this->currentCourseGUID);
+	}
+	if (this->player->optionService->GetPreferenceBool("mapOverlay"))
+	{
+		this->player->PrintConsole(false, false, "[CS2KZ] timer_stop");
+	}
+	return true;
+}
+
+void KZTimerService::TimerStopAll(bool playSound)
+{
+	for (KZPlayer *player : g_pKZPlayerManager->GetAllSlots())
+	{
+		if (!player->timerService)
+		{
+			continue;
+		}
+		player->timerService->TimerStop(playSound);
+	}
+}
+
+void KZTimerService::InvalidateJump()
+{
+	this->validJump = false;
+	this->lastInvalidateTime = g_pKZUtils->GetServerGlobals()->curtime;
+}
+
+void KZTimerService::PlayTimerStartSound()
+{
+	if (g_pKZUtils->GetServerGlobals(true)->curtime - this->lastStartSoundTime > KZ_TIMER_SOUND_COOLDOWN)
+	{
+		utils::PlaySoundToClient(this->player->GetPlayerSlot(), KZ_TIMER_SND_START);
+		this->lastStartSoundTime = g_pKZUtils->GetServerGlobals(true)->curtime;
+	}
+}
+
+void KZTimerService::InvalidateRun()
+{
+	if (!this->validTime)
+	{
+		return;
+	}
+	this->validTime = false;
+
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		eventListeners[i]->OnTimerInvalidated(this->player);
+	}
+}
+
+bool KZTimerService::HasValidMoveType()
+{
+	return KZTimerService::IsValidMoveType(this->player->GetMoveType());
+}
+
+void KZTimerService::PlayTimerEndSound()
+{
+	utils::PlaySoundToClient(this->player->GetPlayerSlot(), KZ_TIMER_SND_END);
+}
+
+void KZTimerService::PlayTimerFalseEndSound()
+{
+	utils::PlaySoundToClient(this->player->GetPlayerSlot(), KZ_TIMER_SND_FALSE_END);
+}
+
+void KZTimerService::PlayMissedZoneSound()
+{
+	utils::PlaySoundToClient(this->player->GetPlayerSlot(), KZ_TIMER_SND_MISSED_ZONE);
+}
+
+void KZTimerService::PlayReachedSplitSound()
+{
+	utils::PlaySoundToClient(this->player->GetPlayerSlot(), KZ_TIMER_SND_REACH_SPLIT);
+}
+
+void KZTimerService::PlayReachedCheckpointSound()
+{
+	utils::PlaySoundToClient(this->player->GetPlayerSlot(), KZ_TIMER_SND_REACH_CHECKPOINT);
+}
+
+void KZTimerService::PlayReachedStageSound()
+{
+	utils::PlaySoundToClient(this->player->GetPlayerSlot(), KZ_TIMER_SND_REACH_STAGE);
+}
+
+void KZTimerService::PlayTimerStopSound()
+{
+	if (this->shouldPlayTimerStopSound)
+	{
+		utils::PlaySoundToClient(this->player->GetPlayerSlot(), KZ_TIMER_SND_STOP);
+	}
+}
+
+void KZTimerService::PlayMissedTimeSound()
+{
+	if (g_pKZUtils->GetServerGlobals(true)->curtime - this->lastMissedTimeSoundTime > KZ_TIMER_SOUND_COOLDOWN)
+	{
+		utils::PlaySoundToClient(this->player->GetPlayerSlot(), KZ_TIMER_SND_MISSED_TIME);
+		this->lastMissedTimeSoundTime = g_pKZUtils->GetServerGlobals(true)->curtime;
+	}
+}
+
+static_function std::string GetTeleportCountText(int tpCount, const char *language)
+{
+	return tpCount == 1 ? KZLanguageService::PrepareMessageWithLang(language, "1 Teleport Text")
+						: KZLanguageService::PrepareMessageWithLang(language, "2+ Teleports Text", tpCount);
+}
+
+void KZTimerService::Pause(bool showError)
+{
+	if (!this->CanPause(showError))
+	{
+		return;
+	}
+
+	bool allowPause = true;
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		allowPause &= eventListeners[i]->OnPause(this->player);
+	}
+	if (!allowPause)
+	{
+		if (showError)
+		{
+			this->player->languageService->PrintChat(true, false, "Can't Pause (Generic)");
+			this->player->PlayErrorSound();
+		}
+		return;
+	}
+
+	this->paused = true;
+	this->pausedOnLadder = this->player->GetMoveType() == MOVETYPE_LADDER;
+	this->lastDuckValue = this->player->GetMoveServices()->m_flDuckAmount;
+	this->lastStaminaValue = this->player->GetMoveServices()->m_flStamina;
+	this->lastDuckTimeValue = this->player->GetMoveServices()->m_flLastDuckTime;
+	this->lastLandedTickValue = this->player->GetMoveServices()->m_ModernJump().m_nLastLandedTick;
+	this->player->SetVelocity(vec3_origin);
+	this->player->SetMoveType(MOVETYPE_NONE);
+	this->player->GetPlayerPawn()->SetGravityScale(0);
+
+	if (this->GetTimerRunning())
+	{
+		this->hasPausedInThisRun = true;
+		this->lastPauseTime = g_pKZUtils->GetServerGlobals()->curtime;
+	}
+
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		eventListeners[i]->OnPausePost(this->player);
+	}
+}
+
+bool KZTimerService::CanPause(bool showError)
+{
+	if (this->paused)
+	{
+		return false;
+	}
+	if (this->JustLanded())
+	{
+		if (showError)
+		{
+			this->player->languageService->PrintChat(true, false, "Can't Pause (Just Landed)");
+			this->player->PlayErrorSound();
+		}
+		return false;
+	}
+	if (this->player->triggerService->InAntiPauseArea())
+	{
+		if (showError)
+		{
+			this->player->languageService->PrintChat(true, false, "Can't Pause (Anti Pause Area)");
+			this->player->PlayErrorSound();
+		}
+		return false;
+	}
+
+	Vector velocity;
+	this->player->GetVelocity(&velocity);
+
+	if (velocity.Length2D() >= KZ_PAUSE_MAX_SPEED)
+	{
+		if (showError)
+		{
+			this->player->languageService->PrintChat(true, false, "Can't Pause (Too Fast)");
+			this->player->PlayErrorSound();
+		}
+		return false;
+	}
+
+	if (this->GetTimerRunning())
+	{
+		if (this->hasResumedInThisRun && g_pKZUtils->GetServerGlobals()->curtime - this->lastResumeTime < KZ_PAUSE_COOLDOWN)
+		{
+			if (showError)
+			{
+				this->player->languageService->PrintChat(true, false, "Can't Pause (Just Resumed)");
+				this->player->PlayErrorSound();
+			}
+			return false;
+		}
+		else if (!(this->player->GetPlayerPawn()->m_fFlags & FL_ONGROUND) && !(velocity.Length2D() == 0.0f && velocity.z == 0.0f))
+		{
+			if (showError)
+			{
+				this->player->languageService->PrintChat(true, false, "Can't Pause (Midair)");
+				this->player->PlayErrorSound();
+			}
+			return false;
+		}
+	}
+	return true;
+}
+
+void KZTimerService::Resume(bool force)
+{
+	if (!this->paused)
+	{
+		return;
+	}
+	if (!force && !this->CanResume(true))
+	{
+		return;
+	}
+
+	bool allowResume = true;
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		allowResume &= eventListeners[i]->OnResume(this->player);
+	}
+	if (!allowResume)
+	{
+		this->player->languageService->PrintChat(true, false, "Can't Resume (Generic)");
+		this->player->PlayErrorSound();
+		return;
+	}
+
+	if (this->pausedOnLadder)
+	{
+		this->player->SetMoveType(MOVETYPE_LADDER);
+	}
+	else
+	{
+		this->player->SetMoveType(MOVETYPE_WALK);
+	}
+
+	// GOKZ: prevent noclip exploit
+	this->player->GetPlayerPawn()->m_Collision().m_CollisionGroup() = KZ_COLLISION_GROUP_STANDARD;
+	this->player->GetPlayerPawn()->CollisionRulesChanged();
+
+	this->paused = false;
+	if (this->GetTimerRunning())
+	{
+		this->hasResumedInThisRun = true;
+		this->lastResumeTime = g_pKZUtils->GetServerGlobals()->curtime;
+	}
+	this->player->GetMoveServices()->m_flDuckAmount = this->lastDuckValue;
+	this->player->GetMoveServices()->m_flStamina = this->lastStaminaValue;
+	this->player->GetMoveServices()->m_flLastDuckTime = this->lastDuckTimeValue;
+	this->player->GetMoveServices()->m_ModernJump().m_nLastLandedTick = this->lastLandedTickValue;
+
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		eventListeners[i]->OnResumePost(this->player);
+	}
+}
+
+bool KZTimerService::CanResume(bool showError)
+{
+	if (this->GetTimerRunning() && this->hasPausedInThisRun && g_pKZUtils->GetServerGlobals()->curtime - this->lastPauseTime < KZ_PAUSE_COOLDOWN)
+	{
+		if (showError)
+		{
+			this->player->languageService->PrintChat(true, false, "Can't Resume (Just Paused)");
+			this->player->PlayErrorSound();
+		}
+		return false;
+	}
+	return true;
+}
+
+void KZTimerService::TogglePause()
+{
+	if (!this->player->awayService->CanControlPawn(true))
+	{
+		return;
+	}
+	if (!this->player->IsAlive())
+	{
+		KZ::misc::JoinTeam(player, CS_TEAM_CT);
+	}
+	else
+	{
+		paused ? Resume() : Pause();
+	}
+}
+
+SCMD(kz_timerstopsound, SCFL_TIMER | SCFL_PREFERENCE)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->timerService->ToggleTimerStopSound();
+	return true;
+}
+
+SCMD_LINK(kz_tss, kz_timerstopsound);
+
+void KZTimerService::ToggleTimerStopSound()
+{
+	this->shouldPlayTimerStopSound = !this->shouldPlayTimerStopSound;
+	this->player->optionService->SetPreferenceBool("timerStopSound", this->shouldPlayTimerStopSound);
+	this->player->languageService->PrintChat(true, false, this->shouldPlayTimerStopSound ? "Timer Stop Sound Enabled" : "Timer Stop Sound Disabled");
+}
+
+// Safeguard
+
+void KZTimerService::ToggleSafeguard()
+{
+	if (this->player->optionService->GetPreferenceInt("safeguard") == SAFEGUARD_NUB)
+	{
+		this->player->optionService->SetPreferenceInt("safeguard", SAFEGUARD_DISABLED);
+		this->player->languageService->PrintChat(true, false, "Safeguard - Disable");
+	}
+	else
+	{
+		this->player->optionService->SetPreferenceInt("safeguard", SAFEGUARD_NUB);
+		this->player->languageService->PrintChat(true, false, "Safeguard - Enable");
+	}
+}
+
+void KZTimerService::ToggleProSafeguard()
+{
+	if (this->player->optionService->GetPreferenceInt("safeguard") == SAFEGUARD_PRO)
+	{
+		this->player->optionService->SetPreferenceInt("safeguard", SAFEGUARD_DISABLED);
+		this->player->languageService->PrintChat(true, false, "Safeguard - Disable");
+	}
+	else
+	{
+		this->player->optionService->SetPreferenceInt("safeguard", SAFEGUARD_PRO);
+		this->player->languageService->PrintChat(true, false, "Safeguard - Enable (PRO)");
+	}
+}
+
+bool KZTimerService::CheckSafeguard(bool showError)
+{
+	if (this->player->optionService->GetPreferenceInt("safeguard") <= SAFEGUARD_DISABLED || !this->GetTimerRunning() || !this->GetValidTimer())
+	{
+		return true;
+	}
+	if (showError)
+	{
+		this->player->languageService->PrintChat(true, false, "Safeguard - Blocked");
+		this->player->PlayErrorSound();
+	}
+	return false;
+}
+
+bool KZTimerService::CheckSafeguardPro(bool showError)
+{
+	if (this->player->optionService->GetPreferenceInt("safeguard") != SAFEGUARD_PRO || !this->GetTimerRunning() || !this->GetValidTimer()
+		|| this->player->checkpointService->GetTeleportCount() > 0)
+	{
+		return true;
+	}
+	if (showError)
+	{
+		this->player->languageService->PrintChat(true, false, "Safeguard - Blocked");
+		this->player->PlayErrorSound();
+	}
+	return false;
+}
+
+bool KZTimerService::CheckSafeguardRestart(bool showError)
+{
+	if (this->player->optionService->GetPreferenceInt("safeguard") <= SAFEGUARD_DISABLED || !this->GetTimerRunning() || !this->GetValidTimer())
+	{
+		return true;
+	}
+	f64 currentTime = g_pKZUtils->GetServerGlobals()->curtime;
+	f64 timeSinceLastAttempt = currentTime - this->lastRestartAttemptTime;
+	f64 cooldown;
+	if (this->lastRestartAttemptTime == 0.0 || timeSinceLastAttempt > KZ_SAFEGUARD_RESTART_MAX_DELAY)
+	{
+		this->lastRestartAttemptTime = currentTime;
+		cooldown = KZ_SAFEGUARD_RESTART_MIN_DELAY;
+	}
+	else
+	{
+		cooldown = KZ_SAFEGUARD_RESTART_MIN_DELAY - timeSinceLastAttempt;
+	}
+	if (cooldown <= 0.0)
+	{
+		this->lastRestartAttemptTime = 0.0;
+		return true;
+	}
+	if (showError)
+	{
+		this->player->languageService->PrintChat(true, false, "Safeguard - Blocked (Restart)", cooldown);
+		this->player->PlayErrorSound();
+	}
+	return false;
+}
+
+SCMD(kz_safeguard, SCFL_TIMER | SCFL_PREFERENCE)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->timerService->ToggleSafeguard();
+	return true;
+}
+
+SCMD_LINK(kz_safe, kz_safeguard);
+SCMD_LINK(kz_sg, kz_safeguard);
+
+SCMD(kz_pro, SCFL_TIMER | SCFL_PREFERENCE)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->timerService->ToggleProSafeguard();
+	return true;
+}
+
+void KZTimerService::Reset()
+{
+	this->timerRunning = {};
+	this->currentTime = {};
+	this->currentCourseGUID = 0;
+	this->lastEndTime = {};
+	this->lastFalseEndTime = {};
+	this->lastStartSoundTime = {};
+	this->lastMissedTimeSoundTime = {};
+	this->validTime = {};
+	this->paused = {};
+	this->pausedOnLadder = {};
+	this->lastPauseTime = {};
+	this->hasPausedInThisRun = {};
+	this->lastResumeTime = {};
+	this->hasResumedInThisRun = {};
+	this->lastDuckValue = {};
+	this->lastStaminaValue = {};
+	this->lastDuckTimeValue = {};
+	this->lastLandedTickValue = {};
+	this->validJump = {};
+	this->lastInvalidateTime = {};
+	this->touchedGroundSinceTouchingStartZone = {};
+	this->shouldPlayTimerStopSound = true;
+	this->lastRestartAttemptTime = {};
+	this->ClearPBCache();
+}
+
+void KZTimerService::OnPhysicsSimulatePost()
+{
+	if (this->player->IsAlive() && this->GetTimerRunning() && !this->GetPaused())
+	{
+		this->currentTime += ENGINE_FIXED_TICK_INTERVAL;
+		this->CheckMissedTime();
+	}
+}
+
+void KZTimerService::OnStartTouchGround()
+{
+	this->touchedGroundSinceTouchingStartZone = true;
+}
+
+void KZTimerService::OnStopTouchGround()
+{
+	if (this->HasValidMoveType() && this->lastInvalidateTime != g_pKZUtils->GetServerGlobals()->curtime)
+	{
+		this->validJump = true;
+	}
+	else
+	{
+		this->InvalidateJump();
+	}
+}
+
+void KZTimerService::OnChangeMoveType(MoveType_t oldMoveType)
+{
+	if (oldMoveType == MOVETYPE_LADDER && this->player->GetMoveType() == MOVETYPE_WALK
+		&& this->lastInvalidateTime != g_pKZUtils->GetServerGlobals()->curtime)
+	{
+		this->validJump = true;
+	}
+	else
+	{
+		this->InvalidateJump();
+	}
+	// Check if player has escaped MOVETYPE_NONE
+	if (!this->paused || this->player->GetMoveType() == MOVETYPE_NONE)
+	{
+		return;
+	}
+
+	this->paused = false;
+	if (this->GetTimerRunning())
+	{
+		this->hasResumedInThisRun = true;
+		this->lastResumeTime = g_pKZUtils->GetServerGlobals()->curtime;
+	}
+
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		eventListeners[i]->OnResumePost(this->player);
+	}
+}
+
+void KZTimerService::OnTeleportToStart()
+{
+	this->TimerStop();
+}
+
+void KZTimerService::OnClientDisconnect()
+{
+	this->TimerStop();
+}
+
+void KZTimerService::OnPlayerSpawn()
+{
+	if (!this->player->GetPlayerPawn() || !this->paused)
+	{
+		return;
+	}
+
+	// Player has left paused state by spawning in, so resume
+	this->paused = false;
+	if (this->GetTimerRunning())
+	{
+		this->hasResumedInThisRun = true;
+		this->lastResumeTime = g_pKZUtils->GetServerGlobals()->curtime;
+	}
+	this->player->GetMoveServices()->m_flDuckAmount = this->lastDuckValue;
+	this->player->GetMoveServices()->m_flStamina = this->lastStaminaValue;
+	this->player->GetMoveServices()->m_flLastDuckTime = this->lastDuckTimeValue;
+	this->player->GetMoveServices()->m_ModernJump().m_nLastLandedTick = this->lastLandedTickValue;
+
+	for (size_t i = 0; i < eventListeners.size(); i++)
+	{
+		eventListeners[i]->OnResumePost(this->player);
+	}
+}
+
+void KZTimerService::OnPlayerJoinTeam(i32 team)
+{
+	if (team == CS_TEAM_SPECTATOR)
+	{
+		this->paused = true;
+		if (this->GetTimerRunning())
+		{
+			this->hasPausedInThisRun = true;
+			this->lastPauseTime = g_pKZUtils->GetServerGlobals()->curtime;
+		}
+
+		for (size_t i = 0; i < eventListeners.size(); i++)
+		{
+			eventListeners[i]->OnPausePost(this->player);
+		}
+	}
+}
+
+void KZTimerService::OnPlayerDeath()
+{
+	this->TimerStop();
+}
+
+void KZTimerService::OnRoundStart()
+{
+	KZTimerService::TimerStopAll();
+}
+
+void KZTimerService::OnTeleport(const Vector *newPosition, const QAngle *newAngles, const Vector *newVelocity)
+{
+	if (newPosition || newVelocity)
+	{
+		this->InvalidateJump();
+	}
+}
+
+SCMD(kz_stop, SCFL_TIMER)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	if (player->timerService->GetTimerRunning())
+	{
+		if (!player->timerService->CheckSafeguard())
+		{
+			return true;
+		}
+		player->timerService->TimerStop();
+	}
+	return true;
+}
+
+SCMD(kz_pause, SCFL_TIMER)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->timerService->TogglePause();
+	return true;
+}
+
+SCMD(kz_comparelevel, SCFL_RECORD | SCFL_TIMER | SCFL_PREFERENCE | SCFL_GLOBAL)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	player->timerService->SetCompareTarget(args->Arg(1));
+	return true;
+}
+
+static_function KZTimerService::CompareType GetCompareTypeFromString(const char *typeString)
+{
+	if (V_stricmp("off", typeString) == 0 || V_stricmp("none", typeString) == 0)
+	{
+		return KZTimerService::CompareType::COMPARE_NONE;
+	}
+	if (V_stricmp("spb", typeString) == 0)
+	{
+		return KZTimerService::CompareType::COMPARE_SPB;
+	}
+	if (V_stricmp("gpb", typeString) == 0 || V_stricmp("pb", typeString) == 0)
+	{
+		return KZTimerService::CompareType::COMPARE_GPB;
+	}
+	if (V_stricmp("sr", typeString) == 0)
+	{
+		return KZTimerService::CompareType::COMPARE_SR;
+	}
+	if (V_stricmp("wr", typeString) == 0)
+	{
+		return KZTimerService::CompareType::COMPARE_WR;
+	}
+	return KZTimerService::CompareType::COMPARETYPE_COUNT;
+}
+
+void KZTimerService::SetCompareTarget(const char *typeString)
+{
+	if (!typeString || !V_stricmp("", typeString))
+	{
+		this->player->languageService->PrintChat(true, false, "Compare Command Usage");
+		return;
+	}
+
+	CompareType type = GetCompareTypeFromString(typeString);
+	if (type == COMPARETYPE_COUNT)
+	{
+		this->player->languageService->PrintChat(true, false, "Compare Command Usage");
+		return;
+	}
+
+	assert(type < COMPARETYPE_COUNT && type >= COMPARE_NONE);
+	switch (type)
+	{
+		case COMPARE_NONE:
+		{
+			this->player->languageService->PrintChat(true, false, "Compare Disabled");
+			break;
+		}
+		case COMPARE_SPB:
+		{
+			this->player->languageService->PrintChat(true, false, "Compare Server PB");
+			break;
+		}
+		case COMPARE_GPB:
+		{
+			this->player->languageService->PrintChat(true, false, "Compare Global PB");
+			break;
+		}
+		case COMPARE_SR:
+		{
+			this->player->languageService->PrintChat(true, false, "Compare Server Record");
+			break;
+		}
+		case COMPARE_WR:
+		{
+			this->player->languageService->PrintChat(true, false, "Compare World Record");
+			break;
+		}
+	}
+	this->preferredCompareType = type;
+	this->player->optionService->SetPreferenceInt("preferredCompareType", this->preferredCompareType);
+	if (this->GetCourse())
+	{
+		this->UpdateCurrentCompareType(ToPBDataKey(KZ::mode::GetModeInfo(this->player->modeService).id, this->GetCourse()->guid));
+	}
+}
+
+void KZTimerService::UpdateCurrentCompareType(PBDataKey key)
+{
+	for (u8 type = this->preferredCompareType; type > COMPARE_NONE; type--)
+	{
+		if (this->GetCompareTargetForType((CompareType)type, key))
+		{
+			this->currentCompareType = (CompareType)type;
+			return;
+		}
+	}
+	this->currentCompareType = COMPARE_NONE;
+}
+
+const PBData *KZTimerService::GetCompareTargetForType(CompareType type, PBDataKey key)
+{
+	switch (type)
+	{
+		case COMPARE_WR:
+		{
+			return KZTimerService::GetCachedRecord(key, true);
+		}
+		case COMPARE_SR:
+		{
+			return KZTimerService::GetCachedRecord(key, false);
+		}
+		case COMPARE_GPB:
+		{
+			return this->GetCachedPB(key, true);
+		}
+		case COMPARE_SPB:
+		{
+			return this->GetCachedPB(key, false);
+		}
+	}
+	return nullptr;
+}
+
+const PBData *KZTimerService::GetCompareTarget(PBDataKey key)
+{
+	return this->GetCompareTargetForType(this->currentCompareType, key);
+}
+
+void KZTimerService::ClearRecordCache()
+{
+	KZTimerService::srCache.clear();
+	KZTimerService::wrCache.clear();
+	CALL_FORWARD(eventListeners, OnRecordCacheCleared);
+	for (KZPlayer *player : g_pKZPlayerManager->GetAllSlots())
+	{
+		if (player->timerService)
+		{
+			player->timerService->ClearPBCache();
+		}
+	}
+}
+
+void KZTimerService::UpdateLocalRecordCache()
+{
+	auto onQuerySuccess = [](std::vector<ISQLQuery *> queries)
+	{
+		ISQLResult *result = queries[0]->GetResultSet();
+		if (result && result->GetRowCount() > 0)
+		{
+			while (result->FetchRow())
+			{
+				auto modeInfo = KZ::mode::GetModeInfoFromDatabaseID(result->GetInt(2));
+				if (modeInfo.databaseID < 0)
+				{
+					continue;
+				}
+				const KZCourseDescriptor *course = KZ::course::GetCourseByLocalCourseID(result->GetInt(1));
+				if (!course)
+				{
+					continue;
+				}
+				KZTimerService::InsertRecordToCache(result->GetFloat(0), course, modeInfo.id, true, false, utils::OrEmpty(result->GetString(3)),
+													result->GetString(4), result->GetString(5));
+			}
+		}
+		result = queries[1]->GetResultSet();
+		if (result && result->GetRowCount() > 0)
+		{
+			while (result->FetchRow())
+			{
+				auto modeInfo = KZ::mode::GetModeInfoFromDatabaseID(result->GetInt(2));
+				if (modeInfo.databaseID < 0)
+				{
+					continue;
+				}
+				const KZCourseDescriptor *course = KZ::course::GetCourseByLocalCourseID(result->GetInt(1));
+				if (!course)
+				{
+					continue;
+				}
+				KZTimerService::InsertRecordToCache(result->GetFloat(0), course, modeInfo.id, false, false, utils::OrEmpty(result->GetString(3)),
+													result->GetString(4), result->GetString(5));
+			}
+		}
+	};
+	KZDatabaseService::QueryAllRecords(g_pKZUtils->GetCurrentMapName(), onQuerySuccess, KZDatabaseService::OnGenericTxnFailure);
+}
+
+const PBData *KZTimerService::GetGlobalCachedRecord(const KZCourseDescriptor *course, PluginId modeID)
+{
+	return KZTimerService::GetCachedRecord(ToPBDataKey(modeID, course->guid), true);
+}
+
+void KZTimerService::InsertRecordToCache(f64 time, const KZCourseDescriptor *course, PluginId modeID, bool overall, bool global,
+										 const std::string &metadata, const char *holder, const char *replayUUID)
+{
+	PBData &pb = global ? KZTimerService::wrCache[ToPBDataKey(modeID, course->guid)] : KZTimerService::srCache[ToPBDataKey(modeID, course->guid)];
+	const bool referenceChanged = !KZ_STREQ((overall ? pb.overall : pb.pro).replayUUID.c_str(), replayUUID ? replayUUID : "");
+
+	overall ? pb.overall.pbTime = time : pb.pro.pbTime = time;
+	(overall ? pb.overall.holder : pb.pro.holder) = holder ? holder : "";
+	(overall ? pb.overall : pb.pro).replayUUID = replayUUID ? replayUUID : "";
+	if (referenceChanged)
+	{
+		CALL_FORWARD(eventListeners, OnRecordCacheUpdated, ToPBDataKey(modeID, course->guid));
+	}
+	KeyValues3 kv(KV3_TYPEEX_TABLE, KV3_SUBTYPE_UNSPECIFIED);
+	CUtlString error = "";
+	if (metadata.empty())
+	{
+		return;
+	}
+	LoadKV3FromJSON(&kv, &error, metadata.c_str(), "");
+	if (!error.IsEmpty())
+	{
+		KZ_LOG_WARN(LogChannel::Timer, "Failed to insert PB to cache due to metadata error: %s\n", error.Get());
+		return;
+	}
+
+	KeyValues3 *data = kv.FindMember("splitZoneTimes");
+	if (data && data->GetType() == KV3_TYPE_ARRAY)
+	{
+		for (i32 i = 0; i < course->splitCount; i++)
+		{
+			f64 time = -1.0f;
+			KeyValues3 *element = data->GetArrayElement(i);
+			if (element)
+			{
+				time = element->GetDouble(-1.0);
+			}
+			overall ? pb.overall.pbSplitZoneTimes[i] = time : pb.pro.pbSplitZoneTimes[i] = time;
+		}
+	}
+
+	data = kv.FindMember("cpZoneTimes");
+	if (data && data->GetType() == KV3_TYPE_ARRAY)
+	{
+		for (i32 i = 0; i < course->checkpointCount; i++)
+		{
+			f64 time = -1.0f;
+			KeyValues3 *element = data->GetArrayElement(i);
+			if (element)
+			{
+				time = element->GetDouble(-1.0);
+			}
+			overall ? pb.overall.pbCpZoneTimes[i] = time : pb.pro.pbCpZoneTimes[i] = time;
+		}
+	}
+
+	data = kv.FindMember("stageZoneTimes");
+	if (data && data->GetType() == KV3_TYPE_ARRAY)
+	{
+		for (i32 i = 0; i < course->stageCount; i++)
+		{
+			f64 time = -1.0f;
+			KeyValues3 *element = data->GetArrayElement(i);
+			if (element)
+			{
+				time = element->GetDouble(-1.0);
+			}
+			overall ? pb.overall.pbStageZoneTimes[i] = time : pb.pro.pbStageZoneTimes[i] = time;
+		}
+	}
+}
+
+void KZTimerService::ClearPBCache()
+{
+	this->localPBCache.clear();
+	this->globalPBCache.clear();
+}
+
+const PBData *KZTimerService::GetGlobalCachedPB(const KZCourseDescriptor *course, PluginId modeID)
+{
+	return this->GetCachedPB(ToPBDataKey(modeID, course->guid), true);
+}
+
+void KZTimerService::InsertPBToCache(f64 time, const KZCourseDescriptor *course, PluginId modeID, bool overall, bool global,
+									 const std::string &metadata, f64 points)
+{
+	PBData &pb = global ? this->globalPBCache[ToPBDataKey(modeID, course->guid)] : this->localPBCache[ToPBDataKey(modeID, course->guid)];
+
+	overall ? pb.overall.points = points : pb.pro.points = points;
+	overall ? pb.overall.pbTime = time : pb.pro.pbTime = time;
+	KeyValues3 kv(KV3_TYPEEX_TABLE, KV3_SUBTYPE_UNSPECIFIED);
+	CUtlString error = "";
+	if (metadata.empty())
+	{
+		return;
+	}
+	LoadKV3FromJSON(&kv, &error, metadata.c_str(), "");
+	if (!error.IsEmpty())
+	{
+		KZ_LOG_WARN(LogChannel::Timer, "Failed to insert server record to cache due to metadata error: %s\n", error.Get());
+		return;
+	}
+
+	KeyValues3 *data = kv.FindMember("splitZoneTimes");
+	if (data && data->GetType() == KV3_TYPE_ARRAY)
+	{
+		for (i32 i = 0; i < course->splitCount; i++)
+		{
+			f64 time = -1.0f;
+			KeyValues3 *element = data->GetArrayElement(i);
+			if (element)
+			{
+				time = element->GetDouble(-1.0);
+			}
+			overall ? pb.overall.pbSplitZoneTimes[i] = time : pb.pro.pbSplitZoneTimes[i] = time;
+		}
+	}
+
+	data = kv.FindMember("cpZoneTimes");
+	if (data && data->GetType() == KV3_TYPE_ARRAY)
+	{
+		for (i32 i = 0; i < course->checkpointCount; i++)
+		{
+			f64 time = -1.0f;
+			KeyValues3 *element = data->GetArrayElement(i);
+			if (element)
+			{
+				time = element->GetDouble(-1.0);
+			}
+			overall ? pb.overall.pbCpZoneTimes[i] = time : pb.pro.pbCpZoneTimes[i] = time;
+		}
+	}
+
+	data = kv.FindMember("stageZoneTimes");
+	if (data && data->GetType() == KV3_TYPE_ARRAY)
+	{
+		for (i32 i = 0; i < course->stageCount; i++)
+		{
+			f64 time = -1.0f;
+			KeyValues3 *element = data->GetArrayElement(i);
+			if (element)
+			{
+				time = element->GetDouble(-1.0);
+			}
+			overall ? pb.overall.pbStageZoneTimes[i] = time : pb.pro.pbStageZoneTimes[i] = time;
+		}
+	}
+}
+
+void KZTimerService::CheckMissedTime()
+{
+	const KZCourseDescriptor *course = this->GetCourse();
+	// No active course, the timer is not running or if we already announce late PBs.
+	if (!course || !this->GetTimerRunning() || (!this->shouldAnnounceMissedTime && !this->shouldAnnounceMissedProTime))
+	{
+		return;
+	}
+	// No comparison available for styled runs.
+	if (!this->player->styleServices.empty())
+	{
+		return;
+	}
+	if (this->player->checkpointService->GetCheckpointCount() > 0)
+	{
+		this->shouldAnnounceMissedProTime = false;
+	}
+	auto modeInfo = KZ::mode::GetModeInfo(this->player->modeService->GetModeName());
+
+	PBDataKey key = ToPBDataKey(modeInfo.id, course->guid);
+
+	// Check if there is personal best data for this mode and course.
+	auto pb = this->GetCompareTarget(key);
+	if (!pb)
+	{
+		return;
+	}
+	if (this->shouldAnnounceMissedProTime && pb->pro.pbTime > 0 && this->GetTime() > pb->pro.pbTime)
+	{
+		// Check if they share the same time.
+		if (this->shouldAnnounceMissedTime && pb->overall.pbTime == pb->pro.pbTime)
+		{
+			std::string timeText = utils::FormatTime(pb->overall.pbTime);
+			this->player->languageService->PrintChat(true, false, missedTimeKeysBoth[this->currentCompareType], timeText.c_str());
+			this->shouldAnnounceMissedTime = false;
+		}
+		else
+		{
+			std::string timeText = utils::FormatTime(pb->pro.pbTime);
+			this->player->languageService->PrintChat(true, false, missedTimeKeysPro[this->currentCompareType], timeText.c_str());
+		}
+		this->shouldAnnounceMissedProTime = false;
+		this->PlayMissedTimeSound();
+	}
+
+	if (this->shouldAnnounceMissedTime && pb->overall.pbTime > 0 && this->GetTime() > pb->overall.pbTime)
+	{
+		std::string timeText = utils::FormatTime(pb->overall.pbTime);
+		this->player->languageService->PrintChat(true, false, missedTimeKeys[this->currentCompareType], timeText.c_str());
+		this->shouldAnnounceMissedTime = false;
+		this->PlayMissedTimeSound();
+	}
+}
+
+void KZTimerService::ShowSplitText(u32 currentSplit)
+{
+	const KZCourseDescriptor *course = this->GetCourse();
+	// No active course so we can't compare anything.
+	if (!course)
+	{
+		return;
+	}
+	// No comparison available for styled runs.
+	if (!this->player->styleServices.empty())
+	{
+		return;
+	}
+
+	std::string time;
+	std::string pbDiff, pbDiffPro = "";
+
+	time = utils::FormatTime(this->splitZoneTimes[currentSplit - 1]);
+	if (this->lastSplit != 0)
+	{
+		f64 diff = this->splitZoneTimes[currentSplit - 1] - this->splitZoneTimes[this->lastSplit - 1];
+		std::string splitTime = KZTimerService::FormatDiffTime(diff);
+		splitTime = tfm::format(" {grey}({default}%s{grey})", splitTime.c_str());
+		time += splitTime;
+	}
+
+	auto modeInfo = KZ::mode::GetModeInfo(this->player->modeService->GetModeName());
+	PBDataKey key = ToPBDataKey(modeInfo.id, course->guid);
+
+	// Check if there is personal best data for this mode and course.
+	const PBData *pb = this->GetCompareTarget(key);
+	if (pb)
+	{
+		if (pb->overall.pbSplitZoneTimes[currentSplit - 1] > 0)
+		{
+			KZ_LOG_DEBUG(LogChannel::Timer, "pb->overall.pbSplitZoneTimes[currentSplit - 1] = %lf\n", pb->overall.pbSplitZoneTimes[currentSplit - 1]);
+			f64 diff = this->splitZoneTimes[currentSplit - 1] - pb->overall.pbSplitZoneTimes[currentSplit - 1];
+			std::string diffText = KZTimerService::FormatDiffTime(diff);
+			diffText = tfm::format("{grey}%s%s{grey}", diff < 0 ? "{green}" : "{lightred}", diffText.c_str());
+			pbDiff = this->player->languageService->PrepareMessage(diffTextKeys[this->currentCompareType], diffText.c_str());
+		}
+		if (this->player->checkpointService->GetTeleportCount() == 0 && pb->pro.pbTime > 0 && pb->pro.pbSplitZoneTimes[currentSplit - 1] > 0)
+		{
+			f64 diff = this->splitZoneTimes[currentSplit - 1] - pb->pro.pbSplitZoneTimes[currentSplit - 1];
+			std::string diffText = KZTimerService::FormatDiffTime(diff);
+			diffText = tfm::format("{grey}%s%s{grey}", diff < 0 ? "{green}" : "{lightred}", diffText.c_str());
+			pbDiffPro = this->player->languageService->PrepareMessage(diffTextKeysPro[this->currentCompareType], diffText.c_str());
+		}
+	}
+
+	this->ReportZone(ZoneKind::Split, currentSplit, this->splitZoneTimes[currentSplit - 1], pb ? pb->overall.pbSplitZoneTimes[currentSplit - 1] : 0.0,
+					 pb && pb->pro.pbTime > 0 ? pb->pro.pbSplitZoneTimes[currentSplit - 1] : 0.0);
+	this->player->languageService->PrintChat(true, false, "Course Split Reached", currentSplit, time.c_str(), pbDiff.c_str(), pbDiffPro.c_str());
+}
+
+void KZTimerService::ShowCheckpointText(u32 currentCheckpoint)
+{
+	const KZCourseDescriptor *course = this->GetCourse();
+	// No active course so we can't compare anything.
+	if (!course)
+	{
+		return;
+	}
+	// No comparison available for styled runs.
+	if (!this->player->styleServices.empty())
+	{
+		return;
+	}
+
+	std::string time;
+	std::string pbDiff, pbDiffPro = "";
+
+	time = utils::FormatTime(this->cpZoneTimes[currentCheckpoint - 1]);
+	if (this->lastCheckpoint != 0)
+	{
+		f64 diff = this->cpZoneTimes[currentCheckpoint - 1] - this->cpZoneTimes[this->lastCheckpoint - 1];
+		std::string splitTime = KZTimerService::FormatDiffTime(diff);
+		splitTime = tfm::format(" {grey}({default}%s{grey})", splitTime.c_str());
+		time += splitTime;
+	}
+
+	auto modeInfo = KZ::mode::GetModeInfo(this->player->modeService->GetModeName());
+	PBDataKey key = ToPBDataKey(modeInfo.id, course->guid);
+
+	// Check if there is personal best data for this mode and course.
+	const PBData *pb = this->GetCompareTarget(key);
+	if (pb)
+	{
+		if (pb->overall.pbCpZoneTimes[currentCheckpoint - 1] > 0)
+		{
+			f64 diff = this->cpZoneTimes[currentCheckpoint - 1] - pb->overall.pbCpZoneTimes[currentCheckpoint - 1];
+			std::string diffText = KZTimerService::FormatDiffTime(diff);
+			diffText = tfm::format("{grey}%s%s{grey}", diff < 0 ? "{green}" : "{lightred}", diffText.c_str());
+			pbDiff = this->player->languageService->PrepareMessage(diffTextKeys[this->currentCompareType], diffText.c_str());
+		}
+		if (this->player->checkpointService->GetTeleportCount() == 0 && pb->pro.pbTime > 0 && pb->pro.pbCpZoneTimes[currentCheckpoint - 1] > 0)
+		{
+			f64 diff = this->cpZoneTimes[currentCheckpoint - 1] - pb->pro.pbCpZoneTimes[currentCheckpoint - 1];
+			std::string diffText = KZTimerService::FormatDiffTime(diff);
+			diffText = tfm::format("{grey}%s%s{grey}", diff < 0 ? "{green}" : "{lightred}", diffText.c_str());
+			pbDiffPro = this->player->languageService->PrepareMessage(diffTextKeysPro[this->currentCompareType], diffText.c_str());
+		}
+	}
+
+	this->ReportZone(ZoneKind::Checkpoint, currentCheckpoint, this->cpZoneTimes[currentCheckpoint - 1],
+					 pb ? pb->overall.pbCpZoneTimes[currentCheckpoint - 1] : 0.0,
+					 pb && pb->pro.pbTime > 0 ? pb->pro.pbCpZoneTimes[currentCheckpoint - 1] : 0.0);
+	this->player->languageService->PrintChat(true, false, "Course Checkpoint Reached", currentCheckpoint, time.c_str(), pbDiff.c_str(),
+											 pbDiffPro.c_str());
+}
+
+void KZTimerService::ShowStageText()
+{
+	const KZCourseDescriptor *course = this->GetCourse();
+	// No active course so we can't compare anything.
+	if (!course)
+	{
+		return;
+	}
+	// No comparison available for styled runs.
+	if (!this->player->styleServices.empty())
+	{
+		return;
+	}
+
+	std::string time;
+	std::string pbDiff, pbDiffPro = "";
+
+	time = utils::FormatTime(this->stageZoneTimes[this->currentStage]);
+	if (this->currentStage > 0)
+	{
+		f64 diff = this->stageZoneTimes[this->currentStage] - this->stageZoneTimes[this->currentStage - 1];
+		std::string splitTime = KZTimerService::FormatDiffTime(diff);
+		splitTime = tfm::format(" {grey}({default}%s{grey})", splitTime.c_str());
+		time += splitTime;
+	}
+
+	auto modeInfo = KZ::mode::GetModeInfo(this->player->modeService->GetModeName());
+	PBDataKey key = ToPBDataKey(modeInfo.id, course->guid);
+
+	// Check if there is personal best data for this mode and course.
+	const PBData *pb = this->GetCompareTarget(key);
+	if (pb)
+	{
+		if (pb->overall.pbStageZoneTimes[this->currentStage] > 0)
+		{
+			f64 diff = this->stageZoneTimes[this->currentStage] - pb->overall.pbStageZoneTimes[this->currentStage];
+			std::string diffText = KZTimerService::FormatDiffTime(diff);
+			diffText = tfm::format("{grey}%s%s{grey}", diff < 0 ? "{green}" : "{lightred}", diffText.c_str());
+			pbDiff = this->player->languageService->PrepareMessage(diffTextKeys[this->currentCompareType], diffText.c_str());
+		}
+		if (this->player->checkpointService->GetTeleportCount() == 0 && pb->pro.pbTime > 0 && pb->pro.pbStageZoneTimes[this->currentStage] > 0)
+		{
+			f64 diff = this->stageZoneTimes[this->currentStage] - pb->pro.pbStageZoneTimes[this->currentStage];
+			std::string diffText = KZTimerService::FormatDiffTime(diff);
+			diffText = tfm::format("{grey}%s%s{grey}", diff < 0 ? "{green}" : "{lightred}", diffText.c_str());
+			pbDiffPro = this->player->languageService->PrepareMessage(diffTextKeysPro[this->currentCompareType], diffText.c_str());
+		}
+	}
+
+	this->ReportZone(ZoneKind::Stage, this->currentStage + 1, this->stageZoneTimes[this->currentStage],
+					 pb ? pb->overall.pbStageZoneTimes[this->currentStage] : 0.0,
+					 pb && pb->pro.pbTime > 0 ? pb->pro.pbStageZoneTimes[this->currentStage] : 0.0);
+	this->player->languageService->PrintChat(true, false, "Course Stage Reached", this->currentStage + 1, time.c_str(), pbDiff.c_str(),
+											 pbDiffPro.c_str());
+}
+
+void KZTimerService::ReportZone(ZoneKind kind, i32 number, f64 time, f64 overallTarget, f64 proTarget)
+{
+	ZoneReport report;
+	report.kind = kind;
+	report.number = number;
+	report.time = time;
+	report.compareType = this->currentCompareType;
+	// A run without teleports is compared with the pro time, which is the one it can still beat.
+	report.pro = this->player->checkpointService->GetTeleportCount() == 0 && proTarget > 0;
+	const f64 target = report.pro ? proTarget : overallTarget;
+	report.hasDiff = target > 0;
+	report.diff = time - target;
+	this->player->hudService->OnZoneReached(report);
+	for (KZPlayer *spec = this->player->specService->GetNextSpectator(NULL); spec != NULL; spec = this->player->specService->GetNextSpectator(spec))
+	{
+		spec->hudService->OnZoneReached(report);
+	}
+}
+
+const PBData *KZTimerService::GetCachedRecord(PBDataKey key, bool global)
+{
+	std::unordered_map<PBDataKey, PBData> &cache = global ? KZTimerService::wrCache : KZTimerService::srCache;
+	auto it = cache.find(key);
+	return it == cache.end() ? nullptr : &it->second;
+}
+
+const PBData *KZTimerService::GetCachedPB(PBDataKey key, bool global)
+{
+	std::unordered_map<PBDataKey, PBData> &cache = global ? this->globalPBCache : this->localPBCache;
+	auto it = cache.find(key);
+	return it == cache.end() ? nullptr : &it->second;
+}
+
+std::string KZTimerService::GetCurrentRunMetadata()
+{
+	KeyValues3 kv(KV3_TYPEEX_TABLE, KV3_SUBTYPE_UNSPECIFIED);
+
+	KeyValues3 *splitZoneTimesKV = kv.FindOrCreateMember("splitZoneTimes");
+
+	splitZoneTimesKV->SetToEmptyArray();
+	for (f64 zoneTime : this->splitZoneTimes)
+	{
+		KeyValues3 *time = splitZoneTimesKV->ArrayAddElementToTail();
+		time->SetDouble(zoneTime);
+	}
+
+	KeyValues3 *cpZoneTimesKV = kv.FindOrCreateMember("cpZoneTimes");
+	cpZoneTimesKV->SetToEmptyArray();
+	for (f64 zoneTime : this->cpZoneTimes)
+	{
+		KeyValues3 *time = cpZoneTimesKV->ArrayAddElementToTail();
+		time->SetDouble(zoneTime);
+	}
+
+	KeyValues3 *stageZoneTimesKV = kv.FindOrCreateMember("stageZoneTimes");
+	stageZoneTimesKV->SetToEmptyArray();
+	for (f64 zoneTime : this->stageZoneTimes)
+	{
+		KeyValues3 *time = stageZoneTimesKV->ArrayAddElementToTail();
+		time->SetDouble(zoneTime);
+	}
+
+	CUtlString result, error;
+	if (SaveKV3AsJSON(&kv, &error, &result))
+	{
+		return result.Get();
+	}
+	KZ_LOG_WARN(LogChannel::Timer, "Failed to obtain current run's metadata! (%s)\n", error.Get());
+	return "";
+}
+
+void KZTimerService::UpdateLocalPBCache()
+{
+	u32 sessionID = player->sessionID;
+
+	auto onQuerySuccess = [sessionID](std::vector<ISQLQuery *> queries)
+	{
+		KZPlayer *pl = g_pKZPlayerManager->SessionToPlayer(sessionID);
+		if (!pl)
+		{
+			return;
+		}
+		ISQLResult *result = queries[0]->GetResultSet();
+		if (result && result->GetRowCount() > 0)
+		{
+			while (result->FetchRow())
+			{
+				auto modeInfo = KZ::mode::GetModeInfoFromDatabaseID(result->GetInt(2));
+				if (modeInfo.databaseID < 0)
+				{
+					continue;
+				}
+				const KZCourseDescriptor *course = KZ::course::GetCourseByLocalCourseID(result->GetInt(1));
+				if (!course)
+				{
+					continue;
+				}
+				pl->timerService->InsertPBToCache(result->GetFloat(0), course, modeInfo.id, true, false, utils::OrEmpty(result->GetString(3)));
+			}
+		}
+		result = queries[1]->GetResultSet();
+		if (result && result->GetRowCount() > 0)
+		{
+			while (result->FetchRow())
+			{
+				auto modeInfo = KZ::mode::GetModeInfoFromDatabaseID(result->GetInt(2));
+				if (modeInfo.databaseID < 0)
+				{
+					continue;
+				}
+				const KZCourseDescriptor *course = KZ::course::GetCourseByLocalCourseID(result->GetInt(1));
+				if (!course)
+				{
+					continue;
+				}
+				pl->timerService->InsertPBToCache(result->GetFloat(0), course, modeInfo.id, false, false, utils::OrEmpty(result->GetString(3)));
+			}
+		}
+	};
+	KZDatabaseService::QueryAllPBs(player->GetSteamId64(), g_pKZUtils->GetCurrentMapName(), onQuerySuccess, KZDatabaseService::OnGenericTxnFailure);
+}
+
+void KZTimerService::Init()
+{
+	KZDatabaseService::RegisterEventListener(&databaseEventListener);
+	KZOptionService::RegisterEventListener(&optionEventListener);
+	KZTimerService::RegisterMenu();
+}
+
+void KZTimerService::ApplyPreferences()
+{
+	if (this->player->optionService->GetPreferenceInt("preferredCompareType", COMPARE_GPB) > COMPARETYPE_COUNT)
+	{
+		this->preferredCompareType = COMPARE_GPB;
+		return;
+	}
+	this->preferredCompareType = (CompareType)this->player->optionService->GetPreferenceInt("preferredCompareType", COMPARE_GPB);
+	this->shouldPlayTimerStopSound = this->player->optionService->GetPreferenceBool("timerStopSound", true);
+	this->autoPauseWhileSpectating = this->player->optionService->GetPreferenceBool("spectatePause", true);
+	this->autoResumeAfterSpectating = this->player->optionService->GetPreferenceBool("spectateResume", true);
+}
+
+void KZDatabaseServiceEventListener_Timer::OnMapSetup()
+{
+	KZ::course::SetupLocalCourses();
+	KZTimerService::UpdateLocalRecordCache();
+}
+
+void KZDatabaseServiceEventListener_Timer::OnClientSetup(Player *player, u64 steamID64, bool isBanned, const char *banReason)
+{
+	KZPlayer *kzPlayer = g_pKZPlayerManager->ToKZPlayer(player);
+	kzPlayer->timerService->UpdateLocalPBCache();
+}
+
+SCMD(kz_recordvolume, SCFL_TIMER | SCFL_GLOBAL | SCFL_PREFERENCE)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	f32 volume = Clamp((f32)utils::StringToFloat(args->Arg(1)), 0.0f, 2.0f);
+	player->optionService->SetPreferenceFloat("recordVolume", volume);
+	player->languageService->PrintChat(true, false, "Record Volume Set", volume);
+	return true;
+}
+
+SCMD(kz_mapoverlay, SCFL_TIMER | SCFL_PREFERENCE)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	bool hasOverlay = player->optionService->GetPreferenceBool("mapOverlay", false);
+	player->optionService->SetPreferenceBool("mapOverlay", !hasOverlay);
+	// clang-format off
+	player->languageService->PrintChat(true, false, player->optionService->GetPreferenceBool("mapOverlay") ? "Map Overlay Enabled" : "Map Overlay Disabled");
+	// clang-format on
+	return true;
+}

@@ -1,0 +1,168 @@
+"RadioPanel.txt"
+{
+	"Groups"
+	{
+		"menu_simple"
+		{
+			"hotkey"	"0"
+			"title"		"存点菜单 (简易)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"存点"
+					"cmd"		"radio; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"传送"
+					"cmd"		"radio; say /tp"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"3"
+					"label"		"暂停/继续"
+					"cmd"		"radio; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"4"
+					"label"		"重置/重生"
+					"cmd"		"radio; say /r"
+				}
+			}
+		}
+
+		"menu_advanced"
+		{
+			"hotkey"	"1"
+			"title"		"存点菜单 (进阶)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"存点"
+					"cmd"		"radio1; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"传送"
+					"cmd"		"radio1; say /tp"
+				}
+
+				"Prev Checkpoint"
+				{
+					"hotkey"	"3"
+					"label"		"上一个存点"
+					"cmd"		"radio1; say /prevcp"
+				}
+
+				"Next Checkpoint"
+				{
+					"hotkey"	"4"
+					"label"		"下一个存点"
+					"cmd"		"radio1; say /nextcp"
+				}
+
+				"Undo Teleport"
+				{
+					"hotkey"	"5"
+					"label"		"撤销传送"
+					"cmd"		"radio1; say /undo"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"6"
+					"label"		"暂停/继续"
+					"cmd"		"radio1; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"7"
+					"label"		"重置/重生"
+					"cmd"		"radio1; say /r"
+				}
+
+				"Noclip"
+				{
+					"hotkey"	"8"
+					"label"		"切换飞行模式"
+					"cmd"		"radio1; say /noclip"
+				}
+			}
+		}
+
+		"menu_option"
+		{
+			"hotkey"	"2"
+			"title"		"选项菜单"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Set Custom Start Position"
+				{
+					"hotkey"	"1"
+					"label"		"设置自定义起点"
+					"cmd"		"say /ssp"
+				}
+
+				"Clear Custom Start Position"
+				{
+					"hotkey"	"2"
+					"label"		"清除自定义起点"
+					"cmd"		"say /csp"
+				}
+
+				"Hide"
+				{
+					"hotkey"	"3"
+					"label"		"显示/隐藏其他玩家"
+					"cmd"		"say /hide"
+				}
+
+				"Hide Weapon"
+				{
+					"hotkey"	"4"
+					"label"		"显示/隐藏武器"
+					"cmd"		"say /hideweapon"
+				}
+
+				"Hide Legs"
+				{
+					"hotkey"	"5"
+					"label"		"显示/隐藏腿部"
+					"cmd"		"say /hidelegs"
+				}
+
+				"Toggle Jumpstats"
+				{
+					"hotkey"	"6"
+					"label"		"切换跳跃数据展示"
+					"cmd"		"say /js"
+				}
+
+				"Toggle Jumpstats Always"
+				{
+					"hotkey"	"7"
+					"label"		"切换总是显示跳跃数据"
+					"cmd"		"say /jsalways"
+				}
+			}
+		}
+	}
+}

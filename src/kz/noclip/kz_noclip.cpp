@@ -1,0 +1,109 @@
+#include "kz_noclip.h"
+
+#include "kz/timer/kz_timer.h"
+#include "kz/language/kz_language.h"
+#include "kz/option/kz_option.h"
+#include "kz/away/kz_away.h"
+
+#include "utils/utils.h"
+#include "utils/simplecmds.h"
+
+#define FL_NOCLIP (1 << 3)
+
+void KZNoclipService::Reset()
+{
+	this->lastNoclipTime = {};
+	this->inNoclip = {};
+}
+
+void KZNoclipService::HandleNoclip()
+{
+	CCSPlayerPawn *pawn = this->player->GetPlayerPawn();
+	if (this->inNoclip)
+	{
+		if ((pawn->m_fFlags() & FL_NOCLIP) == 0)
+		{
+			pawn->m_fFlags(pawn->m_fFlags() | FL_NOCLIP);
+		}
+		// A pause holds the player in place, and noclip picks up again once it ends.
+		if (pawn->m_MoveType() != MOVETYPE_NOCLIP && !this->player->timerService->GetPaused())
+		{
+			this->player->SetMoveType(MOVETYPE_NOCLIP);
+			this->player->timerService->TimerStop();
+		}
+		// if (pawn->m_Collision().m_CollisionGroup() != KZ_COLLISION_GROUP_NOTRIGGER)
+		// {
+		// 	pawn->m_Collision().m_CollisionGroup() = KZ_COLLISION_GROUP_NOTRIGGER;
+		// 	pawn->CollisionRulesChanged();
+		// }
+		this->lastNoclipTime = g_pKZUtils->GetServerGlobals()->curtime;
+		this->player->timerService->TimerStop();
+	}
+	else
+	{
+		if ((pawn->m_fFlags() & FL_NOCLIP) != 0)
+		{
+			pawn->m_fFlags(pawn->m_fFlags() & ~FL_NOCLIP);
+		}
+		if (pawn->m_nActualMoveType() == MOVETYPE_NOCLIP)
+		{
+			this->player->SetMoveType(MOVETYPE_WALK);
+			this->player->timerService->TimerStop();
+		}
+		if (pawn->m_Collision().m_CollisionGroup() != KZ_COLLISION_GROUP_STANDARD)
+		{
+			pawn->m_Collision().m_CollisionGroup() = KZ_COLLISION_GROUP_STANDARD;
+			pawn->CollisionRulesChanged();
+		}
+	}
+	if (pawn->m_nActualMoveType() == MOVETYPE_NOCLIP || pawn->m_MoveType() == MOVETYPE_NOCLIP)
+	{
+		if (this->player->IsAlive() && this->player->timerService->GetTimerRunning())
+		{
+			this->player->timerService->TimerStop();
+		}
+	}
+}
+
+// Commands
+
+SCMD(kz_noclip, SCFL_PLAYER)
+{
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(controller);
+	if (!player->awayService->CanControlPawn(true))
+	{
+		return true;
+	}
+	if (!player->noclipService->IsNoclipping() && !player->timerService->CheckSafeguard())
+	{
+		return true;
+	}
+	player->noclipService->ToggleNoclip();
+	if (player->noclipService->IsNoclipping())
+	{
+		player->languageService->PrintChat(true, false, "Noclip - Enable");
+	}
+	else
+	{
+		player->languageService->PrintChat(true, false, "Noclip - Disable");
+	}
+	return true;
+}
+
+SCMD_LINK(kz_nc, kz_noclip);
+SCMD_LINK(noclip, kz_noclip);
+
+void KZNoclipService::HandleMoveCollision()
+{
+	CCSPlayerPawn *pawn = this->player->GetPlayerPawn();
+	if (!pawn)
+	{
+		return;
+	}
+	if (pawn->m_lifeState() != LIFE_ALIVE)
+	{
+		this->DisableNoclip();
+		return;
+	}
+	this->HandleNoclip();
+}

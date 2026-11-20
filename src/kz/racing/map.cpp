@@ -1,0 +1,60 @@
+#include "kz_racing.h"
+
+void KZRacingService::CheckMap()
+{
+	if (KZRacingService::currentRace.state == RaceInfo::State::None)
+	{
+		return;
+	}
+
+	if (KZRacingService::IsMapCorrectForRace())
+	{
+		return;
+	}
+	else if (KZRacingService::IsMapReadyForChange(KZRacingService::currentRace.conf.workshopID))
+	{
+		// host_workshop_map <workshop ID>
+		std::string command = "host_workshop_map " + std::to_string(KZRacingService::currentRace.conf.workshopID);
+		interfaces::pEngine->ServerCommand(command.c_str());
+	}
+	else if (!KZRacingService::IsMapQueuedForDownload(KZRacingService::currentRace.conf.workshopID))
+	{
+		KZRacingService::TriggerWorkshopDownload(KZRacingService::currentRace.conf.workshopID);
+	}
+}
+
+bool KZRacingService::IsMapCorrectForRace()
+{
+	u32 currentWorkshopID = g_pKZUtils->GetCurrentMapWorkshopID();
+	return currentWorkshopID == KZRacingService::currentRace.conf.workshopID;
+}
+
+bool KZRacingService::IsMapReadyForChange(u64 workshopID)
+{
+	// Make sure it is installed, doesn't need update, and isn't in downloading state.
+	auto state = SteamGameServerUGC()->GetItemState(workshopID);
+	return (state & (k_EItemStateInstalled | k_EItemStateNeedsUpdate | k_EItemStateDownloading | k_EItemStateDownloadPending))
+		   == k_EItemStateInstalled;
+}
+
+bool KZRacingService::IsMapQueuedForDownload(u64 workshopID)
+{
+	return SteamGameServerUGC()->GetItemState(workshopID) & (k_EItemStateDownloading | k_EItemStateDownloadPending);
+}
+
+void KZRacingService::TriggerWorkshopDownload(u64 workshopID)
+{
+	SteamGameServerUGC()->DownloadItem(workshopID, true);
+}
+
+void KZRacingService::ItemDownloadHandler::OnAddonDownloaded(DownloadItemResult_t *pParam)
+{
+	if (pParam->m_eResult != k_EResultOK)
+	{
+		KZ_LOG_WARN(LogChannel::Racing, "Failed to download workshop item %llu, error code: %d\n", pParam->m_nPublishedFileId, pParam->m_eResult);
+		return;
+	}
+
+	KZ_LOG_INFO(LogChannel::Racing, "Successfully downloaded workshop item %llu\n", pParam->m_nPublishedFileId);
+	KZRacingService::CheckMap();
+}

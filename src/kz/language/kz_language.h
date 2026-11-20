@@ -1,0 +1,263 @@
+#pragma once
+#include "vendor/tinyformat.h"
+
+#include "kz/kz.h"
+#include "../spec/kz_spec.h"
+#include "utils/eventlisteners.h"
+
+class KZLanguageService : public KZBaseService
+{
+	using KZBaseService::KZBaseService;
+
+public:
+	static void Init();
+	static void LoadConfigFiles();
+
+	struct AvailableLanguage
+	{
+		std::string code;
+		std::string name;
+		i32 coverage {}; // percent of the loaded phrases that carry this language
+	};
+
+	// The language codes the loaded phrase files actually carry, with a display name where config.txt
+	// names one. Built on first use.
+	static const std::vector<AvailableLanguage> &GetAvailableLanguages();
+	static void LoadLanguages();
+	static void LoadTranslations();
+	static void Cleanup();
+	static void OnActivateServer();
+	static const char *GetBaseAddon();
+
+	struct LanguageInfo
+	{
+		LanguageInfo();
+		enum struct CacheLevel
+		{
+			CACHE_NONE = 0,
+			CACHE_CVAR,
+			CACHE_PREF,
+			CACHE_OVERRIDE
+		} cacheLevel = CacheLevel::CACHE_NONE;
+		char lastAddon[16] {};
+		char language[16] {};
+	};
+
+	static inline std::unordered_map<uint64, LanguageInfo> clientLanguageInfos;
+
+	static void UpdateLanguage(u64 xuid, const char *langKey, LanguageInfo::CacheLevel cacheLevel, bool shouldReconnect = false);
+
+	void OnPlayerConnect(u64 steamID64);
+	void OnPlayerPreferencesLoaded();
+
+	const char *GetLanguage();
+
+	static const char *GetTranslatedFormat(const char *language, const char *phrase);
+
+private:
+	static inline void ReplaceStringInPlace(std::string &subject, std::string_view search, std::string_view replace)
+	{
+		size_t pos = 0;
+		while ((pos = subject.find(search, pos)) != std::string::npos)
+		{
+			subject.replace(pos, search.length(), replace);
+			pos += replace.length();
+		}
+	}
+
+	static std::string BuildTemplate(const char *msgFormat, const char *paramFormat)
+	{
+		std::string inputStr = std::string(msgFormat);
+		const char *tokenStart = paramFormat;
+		int argNumber = 0;
+		while (true)
+		{
+			const char *tokenEnd = strstr(tokenStart, ":");
+			if (!tokenEnd)
+			{
+				break;
+			}
+			const char *replaceStart = tokenEnd + 1;
+			const char *replaceEnd = strstr(replaceStart, ",");
+			if (!replaceEnd)
+			{
+				replaceEnd = paramFormat + strlen(paramFormat);
+				ReplaceStringInPlace(inputStr, '{' + std::string(tokenStart, tokenEnd - tokenStart) + '}',
+									 '%' + std::to_string(++argNumber) + '$' + std::string(replaceStart, replaceEnd - replaceStart));
+				break;
+			}
+			else
+			{
+				ReplaceStringInPlace(inputStr, '{' + std::string(tokenStart, tokenEnd - tokenStart) + '}',
+									 '%' + std::to_string(++argNumber) + '$' + std::string(replaceStart, replaceEnd - replaceStart));
+				tokenStart = replaceEnd + 1;
+			}
+		}
+		return inputStr;
+	}
+
+	template<typename... Args>
+	static std::string GetFormattedMessage(const char *input, const char *format, Args &&...args)
+	{
+		return tfm::format(BuildTemplate(input, format).c_str(), std::forward<Args>(args)...);
+	}
+
+	struct TemplateEntry
+	{
+		std::string str;
+		bool hasFormat;
+	};
+
+	static inline std::unordered_map<std::string, TemplateEntry> formattedTemplateCache;
+
+public:
+	static void ClearTemplateCache()
+	{
+		formattedTemplateCache.clear();
+	}
+
+	static const TemplateEntry &GetTemplateEntry(const char *language, const char *message)
+	{
+		std::string cacheKey;
+		cacheKey.reserve(strlen(language) + 1 + strlen(message));
+		cacheKey.append(language);
+		cacheKey += '\0';
+		cacheKey.append(message);
+
+		auto it = formattedTemplateCache.find(cacheKey);
+		if (it == formattedTemplateCache.end())
+		{
+			const char *paramFormat = GetTranslatedFormat("#format", message);
+			const char *msgFormat = GetTranslatedFormat(language, message);
+			TemplateEntry entry;
+			if (!paramFormat)
+			{
+				entry.str = msgFormat ? msgFormat : message;
+				entry.hasFormat = false;
+			}
+			else
+			{
+				entry.str = BuildTemplate(msgFormat, paramFormat);
+				entry.hasFormat = true;
+			}
+			it = formattedTemplateCache.emplace(std::move(cacheKey), std::move(entry)).first;
+		}
+		return it->second;
+	}
+
+	static bool IsMessageEmpty(const char *language, const char *message)
+	{
+		return GetTemplateEntry(language, message).str.empty();
+	}
+
+	template<typename... Args>
+	static std::string PrepareMessageWithLang(const char *language, const char *message, Args &&...args)
+	{
+		const TemplateEntry &entry = GetTemplateEntry(language, message);
+		if (!entry.hasFormat)
+		{
+			return entry.str;
+		}
+		return tfm::format(entry.str.c_str(), std::forward<Args>(args)...);
+	}
+
+	template<typename... Args>
+	std::string PrepareMessage(const char *message, Args &&...args)
+	{
+		const char *language = GetLanguage();
+		return KZLanguageService::PrepareMessageWithLang(language, message, args...);
+	}
+
+private:
+	enum MessageType : u8
+	{
+		MESSAGE_CHAT,
+		MESSAGE_CONSOLE,
+		MESSAGE_CENTRE,
+		MESSAGE_ALERT,
+		MESSAGE_HTML
+	};
+
+	template<typename... Args>
+	static void PrintType(KZPlayer *player, bool addPrefix, MessageType type, const char *message, Args &&...args)
+	{
+		const char *language = player->languageService->GetLanguage();
+		std::string msg = PrepareMessageWithLang(language, message, args...);
+		switch (type)
+		{
+			case MESSAGE_CHAT:
+			{
+				player->PrintChat(addPrefix, false, msg.c_str());
+				return;
+			}
+			case MESSAGE_CONSOLE:
+			{
+				player->PrintConsole(addPrefix, false, msg.c_str());
+				return;
+			}
+			case MESSAGE_CENTRE:
+			{
+				player->PrintCentre(addPrefix, false, msg.c_str());
+				return;
+			}
+			case MESSAGE_ALERT:
+			{
+				player->PrintAlert(addPrefix, false, msg.c_str());
+				return;
+			}
+			case MESSAGE_HTML:
+			{
+				player->PrintHTMLCentre(addPrefix, false, msg.c_str());
+				return;
+			}
+		}
+	}
+
+	template<typename... Args>
+	static void PrintSingle(KZPlayer *player, bool addPrefix, bool includeSpectators, MessageType type, const char *message, Args &&...args)
+	{
+		PrintType(player, addPrefix, type, message, args...);
+		if (includeSpectators)
+		{
+			for (KZPlayer *spec = player->specService->GetNextSpectator(NULL); spec != NULL; spec = player->specService->GetNextSpectator(spec))
+			{
+				PrintType(spec, addPrefix, type, message, args...);
+			}
+		}
+	}
+
+public:
+	// clang-format off
+#define REGISTER_PRINT_SINGLE_FUNCTION(name, type) \
+	template<typename... Args> \
+	void name(bool addPrefix, bool includeSpectators, const char *message, Args &&...args) \
+	{ \
+		PrintSingle(this->player, addPrefix, includeSpectators, type, message, args...); \
+	}
+
+	// Note: Takes 8 '%' for every % printed for chat, 4 for console.
+	REGISTER_PRINT_SINGLE_FUNCTION(PrintChat, MESSAGE_CHAT)
+	REGISTER_PRINT_SINGLE_FUNCTION(PrintConsole, MESSAGE_CONSOLE)
+	REGISTER_PRINT_SINGLE_FUNCTION(PrintCentre, MESSAGE_CENTRE)
+	REGISTER_PRINT_SINGLE_FUNCTION(PrintAlert, MESSAGE_ALERT)
+	REGISTER_PRINT_SINGLE_FUNCTION(PrintHTMLCentre, MESSAGE_HTML)
+#undef REGISTER_PRINT_SINGLE_FUNCTION
+
+#define REGISTER_PRINT_ALL_FUNCTION(name, type) \
+	template<typename... Args> \
+	static void name(bool addPrefix, const char *message, Args &&...args) \
+	{ \
+		for (KZPlayer *player : g_pKZPlayerManager->GetInGamePlayers()) \
+		{ \
+			PrintSingle(player, addPrefix, false, type, message, args...); \
+		} \
+	}
+
+	REGISTER_PRINT_ALL_FUNCTION(PrintChatAll, MESSAGE_CHAT)
+	REGISTER_PRINT_ALL_FUNCTION(PrintConsoleAll, MESSAGE_CONSOLE)
+	REGISTER_PRINT_ALL_FUNCTION(PrintCentreAll, MESSAGE_CENTRE)
+	REGISTER_PRINT_ALL_FUNCTION(PrintAlertAll, MESSAGE_ALERT)
+	REGISTER_PRINT_ALL_FUNCTION(PrintHTMLCentreAll, MESSAGE_HTML)
+#undef REGISTER_PRINT_ALL_FUNCTION
+	// clang-format on
+};

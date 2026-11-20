@@ -1,0 +1,170 @@
+// CS2KZ Meny (Svensk)
+// Svensk radiomeny stödtillägg för CS2KZ plugin.
+"RadioPanel.txt"
+{
+	"Groups"
+	{
+		"menu_simple"
+		{
+			"hotkey"	"0"
+			"title"		"TP Meny (Enkel)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"Checkpoint"
+					"cmd"		"radio; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"Teleportera"
+					"cmd"		"radio; say /tp"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"3"
+					"label"		"Pausa/Fortsätt"
+					"cmd"		"radio; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"4"
+					"label"		"Starta om"
+					"cmd"		"radio; say /r"
+				}
+			}
+		}
+
+		"menu_advanced"
+		{
+			"hotkey"	"1"
+			"title"		"TP Meny (Advancerad)"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Checkpoint"
+				{
+					"hotkey"	"1"
+					"label"		"Checkpoint"
+					"cmd"		"radio1; say /cp"
+				}
+
+				"Teleport"
+				{
+					"hotkey"	"2"
+					"label"		"Teleportera"
+					"cmd"		"radio1; say /tp"
+				}
+
+				"Prev Checkpoint"
+				{
+					"hotkey"	"3"
+					"label"		"Förra CP"
+					"cmd"		"radio1; say /prevcp"
+				}
+
+				"Next Checkpoint"
+				{
+					"hotkey"	"4"
+					"label"		"Nästa CP"
+					"cmd"		"radio1; say /nextcp"
+				}
+
+				"Undo Teleport"
+				{
+					"hotkey"	"5"
+					"label"		"Ångra TP"
+					"cmd"		"radio1; say /undo"
+				}
+
+				"Pause"
+				{
+					"hotkey"	"6"
+					"label"		"Pausa/Fortsätt"
+					"cmd"		"radio1; say /pause"
+				}
+
+				"Restart"
+				{
+					"hotkey"	"7"
+					"label"		"Starta Om"
+					"cmd"		"radio1; say /r"
+				}
+
+				"Noclip"
+				{
+					"hotkey"	"8"
+					"label"		"Toggla Noclip"
+					"cmd"		"radio1; say /noclip"
+				}
+			}
+		}
+
+		"menu_option"
+		{
+			"hotkey"	"2"
+			"title"		"Alternativ Meny"
+			"timeout"	"100000"
+
+			"Commands"
+			{
+				"Set Custom Start Position"
+				{
+					"hotkey"	"1"
+					"label"		"Skapa Justerad Startposition"
+					"cmd"		"say /ssp"
+				}
+
+				"Clear Custom Start Position"
+				{
+					"hotkey"	"2"
+					"label"		"Rensa Justerad Startposition"
+					"cmd"		"say /csp"
+				}
+
+				"Hide"
+				{
+					"hotkey"	"3"
+					"label"		"Visa/Dölj Andra Spelare"
+					"cmd"		"say /hide"
+				}
+
+				"Hide Weapon"
+				{
+					"hotkey"	"4"
+					"label"		"Visa/Dölj Vapen"
+					"cmd"		"say /hideweapon"
+				}
+
+				"Hide Legs"
+				{
+					"hotkey"	"5"
+					"label"		"Visa/Dölj Ben"
+					"cmd"		"say /hidelegs"
+				}
+
+				"Toggle Jumpstats"
+				{
+					"hotkey"	"6"
+					"label"		"Toggla Jumpstats"
+					"cmd"		"say /js"
+				}
+
+				"Toggle Jumpstats Always"
+				{
+					"hotkey"	"7"
+					"label"		"Toggla Alla Jumpstats"
+					"cmd"		"say /jsalways"
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,394 @@
+#pragma once
+#include "kz/kz.h"
+#include "utils/json.h"
+#include "utils/ws.h"
+#include "public/steam/isteamugc.h"
+
+namespace KZ::racing
+{
+	struct RaceConfig
+	{
+		enum class Format
+		{
+			// The winner is whoever has the fastest run when the race ends.
+			FastestTime,
+			// The winner is whoever crosses the finish line first after the race starts.
+			FirstToFinish,
+		};
+
+		std::string mapName;
+		std::string courseName;
+		u64 workshopID;
+		std::string modeName;
+		Format format;
+		std::optional<u32> maxDurationSeconds;
+		std::optional<u32> maxTeleports;
+
+		bool FromJson(const Json &json);
+	};
+
+	struct RaceResult
+	{
+		enum class Status
+		{
+			Finished,
+			Surrendered,
+			Disconnected,
+			DidNotFinish,
+		};
+
+		Status status;
+		std::string playerName;
+
+		// these two are only present if `status == Finished`
+		std::optional<f64> timeSeconds;
+		std::optional<u32> teleports;
+
+		std::optional<i32> points;
+
+		bool FromJson(const Json &json);
+	};
+
+	namespace events
+	{
+		struct ChatMessage
+		{
+			inline static constexpr const char *tag = "chat_message";
+
+			std::string content;
+
+			// name
+			std::string player;
+
+			ChatMessage() = default;
+
+			ChatMessage(const std::string &content, const char *playerName) : content(content), player(playerName) {}
+
+			bool ToJson(Json &json) const;
+			bool FromJson(const Json &json);
+		};
+
+		struct RaceConfigured
+		{
+			inline static constexpr const char *tag = "race_configured";
+
+			RaceConfig conf;
+
+			bool FromJson(const Json &json);
+		};
+
+		struct RaceStarting
+		{
+			inline static constexpr const char *tag = "race_starting";
+
+			u64 countdownSeconds;
+
+			bool FromJson(const Json &json);
+		};
+
+		struct RaceCancelled
+		{
+			inline static constexpr const char *tag = "race_cancelled";
+
+			bool FromJson(const Json &json);
+		};
+
+		struct RaceDeleted
+		{
+			inline static constexpr const char *tag = "race_deleted";
+
+			bool FromJson(const Json &json);
+		};
+
+		struct RaceCompleted
+		{
+			inline static constexpr const char *tag = "race_completed";
+
+			std::vector<RaceResult> results;
+
+			bool FromJson(const Json &json);
+		};
+
+		struct PlayerReady
+		{
+			inline static constexpr const char *tag = "player_ready";
+
+			// SteamID or name depending on whether we are the sender or recipient
+			std::string player;
+
+			PlayerReady() = default;
+
+			PlayerReady(u64 steamID) : player(std::to_string(steamID)) {}
+
+			bool ToJson(Json &json) const;
+			bool FromJson(const Json &json);
+		};
+
+		struct PlayerFinished
+		{
+			inline static constexpr const char *tag = "player_finished";
+
+			// SteamID or name depending on whether we are the sender or recipient
+			std::string player;
+			f64 timeSeconds;
+			u32 teleports;
+
+			PlayerFinished() = default;
+
+			PlayerFinished(u64 steamID, f64 timeSeconds, u32 teleports)
+				: player(std::to_string(steamID)), timeSeconds(timeSeconds), teleports(teleports)
+			{
+			}
+
+			bool ToJson(Json &json) const;
+			bool FromJson(const Json &json);
+		};
+
+		struct PlayerSurrendered
+		{
+			inline static constexpr const char *tag = "player_surrendered";
+
+			// SteamID or name depending on whether we are the sender or recipient
+			std::string player;
+
+			PlayerSurrendered() = default;
+
+			PlayerSurrendered(u64 steamID) : player(std::to_string(steamID)) {}
+
+			bool ToJson(Json &json) const;
+			bool FromJson(const Json &json);
+		};
+
+		struct PlayerDisconnected
+		{
+			inline static constexpr const char *tag = "player_disconnected";
+
+			// SteamID or name depending on whether we are the sender or recipient
+			std::string player;
+
+			PlayerDisconnected() = default;
+
+			PlayerDisconnected(u64 steamID) : player(std::to_string(steamID)) {}
+
+			bool ToJson(Json &json) const;
+			bool FromJson(const Json &json);
+		};
+	}; // namespace events
+}; // namespace KZ::racing
+
+struct RaceInfo
+{
+	enum class State
+	{
+		None,
+		Init,
+		Ongoing
+	};
+
+	State state = State::None;
+	KZ::racing::RaceConfig conf;
+	std::vector<u64> localParticipants;
+	// This also includes people who surrendered.
+	std::vector<u64> localFinishers;
+	// Server-side only
+	i32 earliestStartTick;
+};
+
+class KZRacingService : public KZBaseService
+{
+public:
+	using KZBaseService::KZBaseService;
+
+	static inline RaceInfo currentRace {};
+
+	virtual void Reset()
+	{
+		this->timerStartTickServer = {};
+		this->racePB = {};
+	}
+
+	/* ===== Coordinator ===== */
+	enum class State
+	{
+		Uninitialized,
+		Configured,
+		Connecting,
+		Connected,
+		Disconnected,
+	};
+
+	/**
+	 * The current connection state
+	 */
+	static inline std::atomic<State> state = State::Uninitialized;
+
+	// INVARIANT: should be `nullptr` when `state == Uninitialized`, and a valid pointer otherwise
+	static inline std::unique_ptr<KZWebSocket::Handle> socket = nullptr;
+
+	static void Init();
+	static void Cleanup();
+
+	/**
+	 * Applies a reloaded server configuration by restarting the WebSocket connection.
+	 *
+	 * Must be called on the main thread. Blocks until the WebSocket thread has been joined.
+	 */
+	static void ReloadConfig();
+	static void OnActivateServer();
+	static void OnServerGamePostSimulate();
+
+	/* ===== Sending events ===== */
+
+	// Note that unlike the global service, these functions do not have callbacks from the coordinator.
+	// The server only acts upon receiving broadcasted messages from the coordinator.
+
+	void SendReady();
+	void SendDisconnected();
+	void SendSurrenderRace();
+	void SendFinishRace(f64 timeSeconds, u32 teleports);
+
+	void SendChatMessage(const std::string &message);
+
+	/* ===== Receiving events =====*/
+	// Called on the WS thread and is therefore async.
+	static void OnWebSocketMessage(KZWebSocket &socket, const ix::WebSocketMessagePtr &message);
+	// Called on the main thread.
+	static void OnChatMessage(const KZ::racing::events::ChatMessage &message);
+	static void OnRaceConfigured(const KZ::racing::events::RaceConfigured &message);
+	static void AfterRaceConfigured();
+	static void OnRaceStarting(const KZ::racing::events::RaceStarting &message);
+	static void OnRaceCancelled(const KZ::racing::events::RaceCancelled &message);
+	static void OnRaceDeleted(const KZ::racing::events::RaceDeleted &message);
+	static void OnRaceCompleted(const KZ::racing::events::RaceCompleted &message);
+	static void OnPlayerReady(const KZ::racing::events::PlayerReady &message);
+	static void OnPlayerFinished(const KZ::racing::events::PlayerFinished &message);
+	static void OnPlayerSurrendered(const KZ::racing::events::PlayerSurrendered &message);
+	static void OnPlayerDisconnected(const KZ::racing::events::PlayerDisconnected &message);
+
+	/**
+	 * Process queued callbacks on the main thread.
+	 * Should be called every frame from the game loop.
+	 */
+	static void ProcessMainThreadCallbacks();
+
+private:
+	/**
+	 * Helper function called by `OnWebSocketMessage()` if we get an `Open` message.
+	 */
+	static void WS_OnOpenMessage();
+
+	/**
+	 * Helper function called by `OnWebSocketMessage()` if we get a `Close` message.
+	 */
+	static void WS_OnCloseMessage(const ix::WebSocketCloseInfo &closeInfo);
+
+	/**
+	 * Helper function called by `OnWebSocketMessage()` if we get an `Error` message.
+	 */
+	static void WS_OnErrorMessage(const ix::WebSocketErrorInfo &errorInfo);
+
+public:
+	/* ===== Map management ===== */
+
+	// Check if a race is active and update the map to the current race's map.
+	static void CheckMap();
+	static bool IsMapCorrectForRace();
+	static bool IsMapReadyForChange(u64 workshopID);
+	static bool IsMapQueuedForDownload(u64 workshopID);
+	static void TriggerWorkshopDownload(u64 workshopID);
+
+	static inline struct ItemDownloadHandler
+	{
+		STEAM_GAMESERVER_CALLBACK_MANUAL(KZRacingService::ItemDownloadHandler, OnAddonDownloaded, DownloadItemResult_t, m_CallbackDownloadItemResult);
+	} itemDownloadHandler;
+
+	/* ===== Race management ===== */
+
+	// Shows the race as an alert to every player who has no MHUD to show it on.
+	static void BroadcastRaceInfo();
+
+	// The race as the MHUD shows it to one viewer.
+	struct HudInfo
+	{
+		bool show {};
+		bool started {};
+		const char *course {};
+		const char *mode {};
+		const char *formatPhrase {};
+		// -1 without a teleport limit.
+		i32 maxTeleports {-1};
+		// 0 without a time limit.
+		f64 timeLimit {};
+		// Counted down instead of the limit, once the race has started.
+		bool showTimeLeft {};
+		f64 timeLeft {};
+		// The fastest time sent in this race, which only a fastest time race shows. 0 hides it.
+		f64 pb {};
+		const char *statusPhrase {};
+		const char *statusClass {};
+		bool countdown {};
+		// GO! at 0 or less.
+		f32 countdownSeconds {};
+	};
+
+	// A spectator sees the race as the player they watch is in it.
+	static void GetHudInfo(KZPlayer *viewer, HudInfo &out);
+
+	// Race participation
+	void AcceptRace();
+	void SurrenderRace();
+	bool IsRaceParticipant();
+	bool IsRaceFinisher();
+	// Whether the race is underway and the player is still in it.
+	bool IsRacing();
+	static void RemoveLocalRaceParticipant(u64 steamID);
+
+	bool CanTeleport();
+	// Return false if a race is active, the player is one of the participants and the start time hasn't arrived yet.
+	// Also returns false if the mode or the course is invalid, or if the player has any active style.
+	bool OnTimerStart(u32 courseGUID);
+
+	i32 timerStartTickServer {};
+	// The fastest time this player has sent in the current race, or 0.
+	f64 racePB {};
+	// Notify the coordinator about the end of the run.
+	void OnTimerEndPost(u32 courseGUID, f32 time, u32 teleportsUsed);
+
+	void OnClientDisconnect();
+
+private:
+	void DrawLegacyHud(const HudInfo &info);
+
+	/**
+	 * Sends a message to the API.
+	 */
+	template<typename T>
+	static bool SendMessage(const T &data)
+	{
+		if (KZRacingService::state.load() != KZRacingService::State::Connected)
+		{
+			return false;
+		}
+
+		return KZRacingService::socket->SendMessage(data);
+	}
+
+	/**
+	 * Callbacks to execute on the main thread as soon as possible.
+	 */
+	static inline struct MainThreadCallbacks
+	{
+		std::mutex mutex;
+		std::vector<std::function<void()>> queue;
+	} mainThreadCallbacks {};
+
+	/**
+	 * Queues a callback to be executed on the main thread as soon as possible.
+	 */
+	template<typename CB>
+	static void AddMainThreadCallback(CB &&callback)
+	{
+		std::unique_lock lock(KZRacingService::mainThreadCallbacks.mutex);
+		KZRacingService::mainThreadCallbacks.queue.emplace_back(std::forward<CB>(callback));
+	}
+};

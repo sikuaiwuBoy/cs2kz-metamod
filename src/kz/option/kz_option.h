@@ -1,0 +1,262 @@
+#pragma once
+#include "kz/kz.h"
+#include "utils/utils.h"
+#include "tier0/keyvalues.h"
+#include "interfaces/interfaces.h"
+#include "filesystem/ifilesystem.h"
+#include "keyvalues3.h"
+#include "utils/eventlisteners.h"
+
+#include <algorithm>
+#include <ctime>
+
+// Written into the set whenever it is saved, so the most recently written copy can be identified.
+#define KZ_PREF_UPDATED_AT "prefsUpdatedAt"
+// A server with a badly wrong clock would otherwise write a stamp that wins everywhere forever.
+#define KZ_PREF_STAMP_MAX_SKEW 86400
+
+class KZOptionServiceEventListener
+{
+public:
+	virtual void OnPlayerPreferencesLoaded(KZPlayer *player) {};
+	virtual void OnPlayerPreferenceChanged(KZPlayer *player, const char *optionName) {};
+};
+
+class KZOptionService : public KZBaseService
+{
+	using KZBaseService::KZBaseService;
+
+	DECLARE_CLASS_EVENT_LISTENER(KZOptionServiceEventListener);
+
+public:
+	static void InitOptions();
+	static void Cleanup();
+
+	/**
+	 * Reload server configuration file.
+	 *
+	 * Returns false and keeps the current configuration if the file cannot be parsed.
+	 *
+	 * NOTE: this *might* invalidate every pointer previously returned by `GetOptionStr()` and (most certainly) `GetOptionKV()`.
+	 * As a result, callers should never store the results of these functions, or risk crashing the server.
+	 */
+	static bool ReloadOptions();
+	static const char *GetOptionStr(const char *optionName, const char *defaultValue = "");
+	static f64 GetOptionFloat(const char *optionName, f64 defaultValue = 0.0);
+	static i64 GetOptionInt(const char *optionName, i64 defaultValue = 0);
+	static KeyValues *GetOptionKV(const char *optionName);
+
+private:
+	static void LoadDefaultOptions();
+
+private:
+	enum
+	{
+		NONE = 0,
+		LOCAL,
+		GLOBAL
+	} dataState, currentState;
+
+	// The stamp of the set currently applied, and per-source arrival guards. Sources can arrive in
+	// either order, so which one is newest is not the same question as which one got here first.
+	i64 loadedStamp {};
+	bool localLoaded {};
+	bool globalLoaded {};
+
+	// When this session last changed a preference, 0 if it has not.
+	i64 modifiedAt {};
+
+	// True when a set carrying this stamp should replace what is already applied.
+	bool ShouldApplyPrefs(i64 incomingStamp, i32 incomingTier);
+	void StampPreferences();
+
+	void MarkUserSet(const char *optionName)
+	{
+		if (std::find(userSetPrefs.begin(), userSetPrefs.end(), optionName) == userSetPrefs.end())
+		{
+			userSetPrefs.push_back(optionName);
+		}
+		time_t now = 0;
+		time(&now);
+		modifiedAt = (i64)now;
+	}
+
+	KeyValues3 prefKV = KeyValues3(KV3_TYPEEX_TABLE, KV3_SUBTYPE_UNSPECIFIED);
+	std::vector<std::string> userSetPrefs; // Track user-modified preferences
+
+public:
+	void Reset()
+	{
+		dataState = NONE;
+		currentState = NONE;
+		loadedStamp = 0;
+		localLoaded = false;
+		globalLoaded = false;
+		modifiedAt = 0;
+		prefKV.SetToEmptyTable();
+		userSetPrefs.clear();
+	}
+
+	// Saving replaces the whole stored set, so it is only safe once this session has read that set. Before then prefKV
+	// holds nothing but this session's changes. A client that drops before its preferences arrive (the reconnect
+	// Multi Addon Manager forces to download the addon does this) would otherwise wipe every stored preference.
+	bool CanSaveLocalPrefs()
+	{
+		return localLoaded && dataState != NONE;
+	}
+
+	bool CanSaveGlobalPrefs()
+	{
+		return globalLoaded && dataState != NONE;
+	}
+
+	void InitializeLocalPrefs(const std::string &text);
+	void InitializeGlobalPrefs(std::string json);
+
+	void SaveLocalPrefs();
+
+	void SaveGlobalPrefs() {}
+
+	void OnPlayerActive();
+
+	void OnClientDisconnect()
+	{
+		SaveLocalPrefs();
+		SaveGlobalPrefs();
+	}
+
+	void GetPreferencesAsJSON(std::string *error, std::string *output)
+	{
+		this->StampPreferences();
+		CUtlString kv3Error, kv3Output;
+		SaveKV3AsJSON(&this->prefKV, &kv3Error, &kv3Output);
+		*error = kv3Error.Get();
+		*output = kv3Output.Get();
+	}
+
+	// True once the player has a value for this preference, as opposed to falling back to a default.
+	bool HasPreference(const char *optionName)
+	{
+		return prefKV.FindMember(optionName) != NULL;
+	}
+
+	// Due to the way keyvalues3.h is written, we can't template these functions.
+	void SetPreferenceBool(const char *optionName, bool value)
+	{
+		MarkUserSet(optionName);
+		prefKV.FindOrCreateMember(optionName)->SetBool(value);
+		CALL_FORWARD(eventListeners, OnPlayerPreferenceChanged, this->player, optionName);
+	}
+
+	bool GetPreferenceBool(const char *optionName, bool defaultValue = false)
+	{
+		KeyValues3 *option = prefKV.FindMember(optionName);
+		if (!option)
+		{
+			return defaultValue;
+		}
+		return option->GetBool(defaultValue);
+	}
+
+	void SetPreferenceFloat(const char *optionName, f64 value)
+	{
+		MarkUserSet(optionName);
+		prefKV.FindOrCreateMember(optionName)->SetDouble(value);
+		CALL_FORWARD(eventListeners, OnPlayerPreferenceChanged, this->player, optionName);
+	}
+
+	f64 GetPreferenceFloat(const char *optionName, f64 defaultValue = 0.0)
+	{
+		KeyValues3 *option = prefKV.FindMember(optionName);
+		if (!option)
+		{
+			return defaultValue;
+		}
+		return option->GetDouble(defaultValue);
+	}
+
+	void SetPreferenceInt(const char *optionName, i64 value)
+	{
+		MarkUserSet(optionName);
+		prefKV.FindOrCreateMember(optionName)->SetInt64(value);
+		CALL_FORWARD(eventListeners, OnPlayerPreferenceChanged, this->player, optionName);
+	}
+
+	i64 GetPreferenceInt(const char *optionName, i64 defaultValue = 0)
+	{
+		KeyValues3 *option = prefKV.FindMember(optionName);
+		if (!option)
+		{
+			return defaultValue;
+		}
+		return option->GetInt64(defaultValue);
+	}
+
+	void SetPreferenceStr(const char *optionName, const char *value)
+	{
+		MarkUserSet(optionName);
+		prefKV.FindOrCreateMember(optionName)->SetString(value);
+		CALL_FORWARD(eventListeners, OnPlayerPreferenceChanged, this->player, optionName);
+	}
+
+	const char *GetPreferenceStr(const char *optionName, const char *defaultValue = "")
+	{
+		KeyValues3 *option = prefKV.FindMember(optionName);
+		if (!option)
+		{
+			return defaultValue;
+		}
+		// DebugPrintKV3(&prefKV);
+		return option->GetString(defaultValue);
+	}
+
+	// TODO: Use these functions for existing color prefs as well.
+	void SetPreferenceColor(const char *optionName, const Color &value)
+	{
+		SetPreferenceInt(optionName, ((i64)value.r() << 24) | ((i64)value.g() << 16) | ((i64)value.b() << 8) | (i64)value.a());
+	}
+
+	Color GetPreferenceColor(const char *optionName, const Color &defaultValue)
+	{
+		i64 fallback = ((i64)defaultValue.r() << 24) | ((i64)defaultValue.g() << 16) | ((i64)defaultValue.b() << 8) | (i64)defaultValue.a();
+		i64 packed = GetPreferenceInt(optionName, fallback);
+		return Color((u8)((packed >> 24) & 0xFF), (u8)((packed >> 16) & 0xFF), (u8)((packed >> 8) & 0xFF), (u8)(packed & 0xFF));
+	}
+
+	void SetPreferenceVector(const char *optionName, const Vector &value)
+	{
+		MarkUserSet(optionName);
+		prefKV.FindOrCreateMember(optionName)->SetVector(value);
+		CALL_FORWARD(eventListeners, OnPlayerPreferenceChanged, this->player, optionName);
+	}
+
+	Vector GetPreferenceVector(const char *optionName, const Vector &defaultValue = Vector(0.0f, 0.0f, 0.0f))
+	{
+		KeyValues3 *option = prefKV.FindMember(optionName);
+		if (!option)
+		{
+			return defaultValue;
+		}
+		return option->GetVector(defaultValue);
+	}
+
+	void SetPreferenceTable(const char *optionName, const KeyValues3 &value)
+	{
+		MarkUserSet(optionName);
+		KeyValues3 *option = prefKV.FindOrCreateMember(optionName);
+		option->SetToEmptyTable();
+		*option = value;
+		CALL_FORWARD(eventListeners, OnPlayerPreferenceChanged, this->player, optionName);
+	}
+
+	void GetPreferenceTable(const char *optionName, KeyValues3 &output, const KeyValues3 &defaultValue = KeyValues3())
+	{
+		KeyValues3 *option = prefKV.FindMember(optionName);
+		if (!option)
+		{
+			output = defaultValue;
+			return;
+		}
+		output = *option;
+	}
+};

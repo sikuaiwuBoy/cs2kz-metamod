@@ -1,0 +1,124 @@
+name: Translations checks
+
+on:
+  push:
+    paths:
+      - "translations/cs2kz-*.phrases.txt"
+      - "translations/config.txt"
+      - "menu/*.txt"
+      - ".github/workflows/check-translations.yaml"
+  pull_request:
+    paths:
+      - "translations/cs2kz-*.phrases.txt"
+      - "translations/config.txt"
+      - "menu/*.txt"
+      - ".github/workflows/check-translations.yaml"
+
+jobs:
+  lint-translations:
+    name: Lint Translation Files
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: false
+      - name: Get source commit info
+        id: source
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "message=$(git log -1 --pretty=%s | tr -d '"' | tr -d "'" | tr -d '`' | cut -c1-80)" >> "$GITHUB_OUTPUT"
+
+      - name: Run translation linter
+        uses: jvnipers/kv-lint@v1
+        with:
+          phrases: translations/cs2kz-*.phrases.txt
+          radiopanel: menu/*.txt
+          languages: translations/config.txt
+          report: missing-translations.txt
+          json: missing-translations.json
+          markdown: translation-summary.md
+          output: translation-lint-results.txt
+      - name: Write clean lint results
+        run: '[ -f translation-lint-results.txt ] || echo "No issues found!" > translation-lint-results.txt'
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: translation-reports
+          path: |
+            translation-lint-results.txt
+            missing-translations.txt
+            missing-translations.json
+          retention-days: 30
+
+      - name: Push results to translation-reports branch
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA_FULL: ${{ steps.source.outputs.sha }}
+          COMMIT_SHA: ${{ steps.source.outputs.sha_short }}
+          COMMIT_MSG: ${{ steps.source.outputs.message }}
+        run: |
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+          # Move report files to temp directory BEFORE switching branches
+          mkdir -p /tmp/reports
+          mv translation-lint-results.txt /tmp/reports/
+          mv missing-translations.txt /tmp/reports/
+          mv missing-translations.json /tmp/reports/
+          mv translation-summary.md /tmp/translation-summary.md
+
+          # Switch to reports branch
+          if git ls-remote --exit-code --heads origin translation-reports > /dev/null 2>&1; then
+            git fetch origin translation-reports
+            git checkout translation-reports
+          else
+            git checkout --orphan translation-reports
+            git rm -rf . > /dev/null 2>&1 || true
+          fi
+
+          # Clean working directory and copy reports back
+          rm -rf ./* 2>/dev/null || true
+          cp /tmp/reports/* .
+
+          # Create README around kv-lint's status and coverage sections
+          {
+          printf '# Translation Reports\n\nAutomated translation linter reports for cs2kz-metamod.\n\n'
+          cat /tmp/translation-summary.md
+          cat << EOF
+
+          ## Reports
+
+          | File | Description |
+          |------|-------------|
+          | [translation-lint-results.txt](translation-lint-results.txt) | Linter errors and warnings |
+          | [missing-translations.txt](missing-translations.txt) | Detailed missing translations report |
+          | [missing-translations.json](missing-translations.json) | Machine-readable JSON export |
+
+          ## Last Updated
+
+          - **Commit:** [\`${COMMIT_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA_FULL})
+          - **Time:** ${TIMESTAMP}
+          - **Message:** ${COMMIT_MSG}
+
+          ---
+
+          *This report is automatically generated on each push to master.*
+          EOF
+          } > README.md
+
+          # Commit and push
+          git add -A
+          git commit -m "Update translation reports
+
+          Source: ${COMMIT_SHA} - ${COMMIT_MSG}" || echo "No changes to commit"
+          git push origin translation-reports --force
