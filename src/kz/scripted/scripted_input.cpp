@@ -2,6 +2,8 @@
 
 #include "kz/kz.h"
 #include "kz/jumpstats/kz_jumpstats.h"
+#include "sdk/navphysicsinterface.h"
+#include "sdk/tracefilter.h"
 #include "utils/simplecmds.h"
 #include "utils/utils.h"
 
@@ -743,6 +745,34 @@ CON_COMMAND_F(kz_cmdlog_stop, "Stop usercmd logging for a slot: kz_cmdlog_stop <
 		log.file.close();
 	}
 	META_CONPRINTF("[KZScript] cmdlog stop slot=%d tag=%s\n", slot, log.tag.c_str());
+}
+
+CON_COMMAND_F(kz_probe_z, "Trace a player hull straight down and print the ground height: kz_probe_z <x> <y> [slot] [start_z]", FCVAR_NONE)
+{
+	if (args.ArgC() < 3)
+	{
+		META_CONPRINTF("[KZProbe] usage: kz_probe_z <x> <y> [slot] [start_z]\n");
+		return;
+	}
+	f32 x = (f32)atof(args.Arg(1));
+	f32 y = (f32)atof(args.Arg(2));
+	int slot = args.ArgC() >= 4 ? atoi(args.Arg(3)) : 0;
+	f32 startZ = args.ArgC() >= 5 ? (f32)atof(args.Arg(4)) : 2000.0f;
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(CPlayerSlot(slot));
+	CCSPlayerPawn *pawn = player ? player->GetPlayerPawn() : nullptr;
+	if (!pawn)
+	{
+		META_CONPRINTF("[KZProbe] no pawn in slot %d\n", slot);
+		return;
+	}
+	CTraceFilterPlayerMovementCS filter(pawn);
+	bbox_t bounds;
+	bounds.mins = {-16.0f, -16.0f, 0.0f};
+	bounds.maxs = {16.0f, 16.0f, 72.0f};
+	trace_t trace;
+	INavPhysicsInterface::TraceShape(Ray_t(bounds.mins, bounds.maxs), Vector(x, y, startZ), Vector(x, y, -2000.0f), &filter, &trace);
+	META_CONPRINTF("[KZProbe] x=%.3f y=%.3f z=%.4f start_solid=%d frac=%.4f nz=%.3f\n", x, y, trace.m_vEndPos.z, trace.m_bStartInSolid ? 1 : 0,
+				   trace.m_flFraction, trace.m_vHitNormal.z);
 }
 
 CON_COMMAND_F(kz_script_delay, "Set scripted playback start delay in ticks: kz_script_delay <ticks> (default 64)", FCVAR_NONE)
