@@ -159,6 +159,7 @@ namespace scripted
 				 << base->upmove() << ',' << base->buttons_pb().buttonstate1() << ',' << base->viewangles().y() << ',' << base->viewangles().x()
 				 << ',' << subtick << ',' << origin.x << ',' << origin.y << ',' << origin.z << ',' << vel.x << ',' << vel.y << ',' << vel.z << ','
 				 << ((player->GetPlayerPawn()->m_fFlags() & FL_ONGROUND) ? 1 : 0) << '\n';
+		g_cmdLog.flush();
 	}
 } // namespace scripted
 
@@ -361,6 +362,7 @@ bool ScriptedInput::OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
 	{
 		this->log << tick << ',' << this->index << ',' << origin.x << ',' << origin.y << ',' << origin.z << ',' << vel.x << ',' << vel.y << ','
 				  << vel.z << ',' << (onGround ? 1 : 0) << ',' << t.yaw << '\n';
+		this->log.flush();
 	}
 
 	this->index++;
@@ -424,4 +426,65 @@ SCMD(kz_script_status, SCFL_MISC)
 	}
 	scripted::GetForPlayer(player)->PrintStatus(player);
 	return true;
+}
+
+// Server-console variants (work from RCON / server console, no client needed).
+CON_COMMAND_F(kz_script_start_bot, "Load and start a script on a player slot from the server console: kz_script_start_bot <slot> <csv path>",
+			  FCVAR_NONE)
+{
+	if (args.ArgC() < 3)
+	{
+		META_CONPRINTF("[KZScript] usage: kz_script_start_bot <slot> <path>\n");
+		return;
+	}
+	int slot = atoi(args.Arg(1));
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(CPlayerSlot(slot));
+	if (!player)
+	{
+		META_CONPRINTF("[KZScript] no player in slot %d\n", slot);
+		return;
+	}
+	ScriptedInput *input = scripted::GetForPlayer(player);
+	if (!input)
+	{
+		META_CONPRINTF("[KZScript] invalid slot %d\n", slot);
+		return;
+	}
+	META_CONPRINTF("[KZScript] bot start slot=%d fake=%d path=%s\n", slot, player->IsFakeClient() ? 1 : 0, args.Arg(2));
+	if (input->Load(args.Arg(2)))
+	{
+		input->Start(player);
+	}
+}
+
+CON_COMMAND_F(kz_script_bot_stop, "Stop scripted playback for a player slot: kz_script_bot_stop <slot>", FCVAR_NONE)
+{
+	if (args.ArgC() < 2)
+	{
+		META_CONPRINTF("[KZScript] usage: kz_script_bot_stop <slot>\n");
+		return;
+	}
+	int slot = atoi(args.Arg(1));
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(CPlayerSlot(slot));
+	ScriptedInput *input = player ? scripted::GetForPlayer(player) : nullptr;
+	if (input)
+	{
+		input->Stop();
+		META_CONPRINTF("[KZScript] stopped slot=%d\n", slot);
+	}
+}
+
+CON_COMMAND_F(kz_script_bot_status, "Print scripted playback status for a player slot: kz_script_bot_status <slot>", FCVAR_NONE)
+{
+	if (args.ArgC() < 2)
+	{
+		return;
+	}
+	int slot = atoi(args.Arg(1));
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(CPlayerSlot(slot));
+	ScriptedInput *input = player ? scripted::GetForPlayer(player) : nullptr;
+	if (input)
+	{
+		input->PrintStatus(player);
+	}
 }
