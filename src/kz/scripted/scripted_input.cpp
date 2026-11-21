@@ -404,7 +404,8 @@ bool ScriptedInput::Start(KZPlayer *player)
 	this->log.open(logPath, std::ios::out | std::ios::trunc);
 	if (this->log.is_open())
 	{
-		this->log << "tick_count,script_idx,origin_x,origin_y,origin_z,vel_x,vel_y,vel_z,on_ground,yaw,eye_yaw,consumed,svac\n";
+		this->log << "tick_count,script_idx,origin_x,origin_y,origin_z,vel_x,vel_y,vel_z,on_ground,yaw,eye_yaw,consumed,svac,"
+					 "flags,movetype,duck_amount,ducked\n";
 	}
 	META_CONPRINTF("[KZScript] start slot=%d path=%s ticks=%zu start_tick=%u\n", player->GetPlayerSlot().Get(), this->path.c_str(),
 				   this->ticks.size(), this->startTick);
@@ -560,7 +561,8 @@ bool ScriptedInput::OnPlayerRunCommand(KZPlayer *player, CUserCmd *cmd)
 		i32 angleChanges = pawn->m_ServerViewAngleChanges().Count();
 		this->log << tick << ',' << this->index << ',' << origin.x << ',' << origin.y << ',' << origin.z << ',' << vel.x << ',' << vel.y << ','
 				  << vel.z << ',' << (onGround ? 1 : 0) << ',' << t.yaw << ',' << eyeAngles.y << ',' << cmd->base().consumed_server_angle_changes()
-				  << ',' << angleChanges << '\n';
+				  << ',' << angleChanges << ',' << (u32)pawn->m_fFlags() << ',' << (u32)pawn->m_MoveType() << ','
+				  << player->GetMoveServices()->m_flDuckAmount << ',' << (player->GetMoveServices()->m_bDucked ? 1 : 0) << '\n';
 		this->log.flush();
 	}
 
