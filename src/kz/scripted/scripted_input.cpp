@@ -46,7 +46,8 @@ namespace
 			g_jumpLog << "server_tick,player_slot,jump_type,valid,invalid_reason,official_distance,raw_distance,"
 						 "takeoff_speed,max_speed,landing_speed,strafes,sync,takeoff_x,takeoff_y,takeoff_z,"
 						 "landing_x,landing_y,landing_z,air_ticks,ground_z_takeoff,"
-						 "landing_origin_actual_x,landing_origin_actual_y,landing_origin_actual_z,offset\n";
+						 "landing_origin_actual_x,landing_origin_actual_y,landing_origin_actual_z,offset,"
+						 "block,edge,landing_edge\n";
 		}
 		g_SMAPI->PathFormat(path, sizeof(path), "%s/addons/cs2kz/logs/lj_cmds.csv", g_SMAPI->GetBaseDir());
 		g_cmdLog.open(path, std::ios::out | std::ios::app);
@@ -214,7 +215,8 @@ namespace scripted
 				  << ",\"" << jump->invalidateReason << "\"," << jump->GetDistance(true, false) << ',' << raw << ',' << jump->GetTakeoffSpeed() << ','
 				  << jump->GetMaxSpeed() << ',' << vel.Length2D() << ',' << jump->strafes.size() << ',' << jump->GetSync() << ',' << t.x << ',' << t.y
 				  << ',' << t.z << ',' << l.x << ',' << l.y << ',' << l.z << ',' << (int)std::lround(jump->airtime * 64.0f) << ','
-				  << player->takeoffGroundOrigin.z << ',' << l.x << ',' << l.y << ',' << l.z << ',' << jump->GetOffset() << '\n';
+				  << player->takeoffGroundOrigin.z << ',' << l.x << ',' << l.y << ',' << l.z << ',' << jump->GetOffset()
+				  << ',' << jump->GetBlock() << ',' << jump->GetEdge(false) << ',' << jump->GetEdge(true) << '\n';
 		g_jumpLog.flush();
 	}
 
