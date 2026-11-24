@@ -17,6 +17,7 @@
 #include "engine2/networkgameserverbase.h"
 #include "igamesystem.h"
 #include "utils/async_file_io.h"
+#include "utils/http.h"
 
 #include "sdk/steamnetworkingsockets.h"
 
@@ -276,6 +277,7 @@ static KHook::Virtual<ISource2Server, void> gameServerSteamAPIActivatedHook(Game
 static KHook::Return<void> GameServerSteamAPIDeactivatedPre(ISource2Server *pThis)
 {
 	VPROF_BUDGET(__func__, "CS2KZ");
+	HTTP::Cleanup();
 	return {KHook::Action::Ignore};
 }
 
@@ -542,15 +544,15 @@ static KHook::Virtual<ICvar, void, ConCommandRef, const CCommandContext &, const
 // ============================================================
 
 static KHook::Return<void> PostEventPre(IGameEventSystem *pThis, CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64 *clients,
-										INetworkMessageInternal *pEvent, const CNetMessage *pData, unsigned long nSize, NetChannelBufType_t bufType)
+										NetMessageInfo_t *pEvent, const CNetMessage *pData, unsigned long nSize, NetChannelBufType_t bufType)
 {
 	VPROF_BUDGET(__func__, "CS2KZ");
 	KZ::quiet::OnPostEvent(pEvent, pData, clients);
 	return {KHook::Action::Ignore};
 }
 
-static KHook::Virtual<IGameEventSystem, void, CSplitScreenSlot, bool, int, const uint64 *, INetworkMessageInternal *, const CNetMessage *,
-					  unsigned long, NetChannelBufType_t>
+static KHook::Virtual<IGameEventSystem, void, CSplitScreenSlot, bool, int, const uint64 *, NetMessageInfo_t *, const CNetMessage *, unsigned long,
+					  NetChannelBufType_t>
 	postEventHook(PostEventPre, nullptr);
 
 // ============================================================
@@ -724,6 +726,10 @@ static KHook::Return<void> PlayerRunCommandPre(CCSPlayer_MovementServices *pThis
 {
 	VPROF_BUDGET(__func__, "CS2KZ");
 	KZPlayer *player = g_pKZPlayerManager->ToPlayer(pThis);
+	if (!player)
+	{
+		return {KHook::Action::Ignore};
+	}
 	player->awayService->OnPlayerRunCommandPre(pCmd);
 	if (!player->OnPlayerRunCommand(pCmd))
 	{
@@ -735,7 +741,12 @@ static KHook::Return<void> PlayerRunCommandPre(CCSPlayer_MovementServices *pThis
 static KHook::Return<void> PlayerRunCommandPost(CCSPlayer_MovementServices *pThis, CUserCmd *pCmd)
 {
 	VPROF_BUDGET(__func__, "CS2KZ");
-	g_pKZPlayerManager->ToPlayer(pThis)->awayService->OnPlayerRunCommandPost();
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(pThis);
+	if (!player)
+	{
+		return {KHook::Action::Ignore};
+	}
+	player->awayService->OnPlayerRunCommandPost();
 	return {KHook::Action::Ignore};
 }
 
