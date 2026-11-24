@@ -23,6 +23,7 @@
 #include "quiet/kz_quiet.h"
 #include "spec/kz_spec.h"
 #include "goto/kz_goto.h"
+#include "scripted/scripted_input.h"
 #include "style/kz_style.h"
 #include "telemetry/kz_telemetry.h"
 #include "timer/kz_timer.h"
@@ -314,6 +315,8 @@ bool KZPlayer::OnPlayerRunCommand(CUserCmd *cmd)
 	{
 		return false;
 	}
+	// Scripted playback: overwrite the command before the engine runs it.
+	scripted::OnPlayerRunCommand(this, cmd);
 	// Fast replay playback simulates several replay ticks in one server tick. The engine runs the last command, the
 	// others run here with the same per-tick logic around them.
 	while (KZ::replaysystem::HasQueuedReplayTicks(this))

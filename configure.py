@@ -18,6 +18,24 @@ if ambuild_version.startswith('2.1'):
   sys.stderr.write("AMBuild 2.2 or higher is required; please update\n")
   sys.exit(1)
 
+# The branch was seeded from a truncated source export; restore the checked-in vendor binaries.
+import os
+import urllib.request
+
+_vendor_base = 'https://raw.githubusercontent.com/KZGlobalTeam/cs2kz-metamod/v0.0.197/'
+_vendor_files = [
+  'vendor/tinyformat.h', 'vendor/zstd.AMBuilder', 'vendor/zstd.lib', 'vendor/libzstd.a',
+  'vendor/ixwebsocket.lib', 'vendor/libixwebsocket.a', 'vendor/steam_api64.lib',
+  'vendor/libssl.lib', 'vendor/libcrypto.lib',
+]
+_src_root = os.path.dirname(os.path.abspath(__file__))
+for _rel in _vendor_files:
+  _dst = os.path.join(_src_root, _rel)
+  if not os.path.exists(_dst) or os.path.getsize(_dst) < 1024:
+    sys.stderr.write('restoring %s\n' % _rel)
+    os.makedirs(os.path.dirname(_dst), exist_ok=True)
+    urllib.request.urlretrieve(_vendor_base + _rel, _dst)
+
 parser = run.BuildParser(sourcePath=sys.path[0], api='2.2')
 parser.options.add_argument('-n', '--plugin-name', type=str, dest='plugin_name', default='cs2kz',
                        help='Plugin name')
