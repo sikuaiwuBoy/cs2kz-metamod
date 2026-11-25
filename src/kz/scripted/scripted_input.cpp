@@ -811,10 +811,10 @@ CON_COMMAND_F(kz_trace_hull, "Sweep a player hull from A to B: kz_trace_hull x1 
 	bounds.maxs = {16.0f, 16.0f, duck ? 54.0f : 72.0f};
 	trace_t trace;
 	INavPhysicsInterface::TraceShape(Ray_t(bounds.mins, bounds.maxs), a, b, &filter, &trace);
-	META_CONPRINTF("[KZTrace] frac=%.5f end=%.3f %.3f %.3f normal=%.3f %.3f %.3f start_solid=%d ent=%d\n",
+	META_CONPRINTF("[KZTrace] frac=%.5f end=%.3f %.3f %.3f normal=%.3f %.3f %.3f start_solid=%d type=%s\n",
 				   trace.m_flFraction, trace.m_vEndPos.x, trace.m_vEndPos.y, trace.m_vEndPos.z,
 				   trace.m_vHitNormal.x, trace.m_vHitNormal.y, trace.m_vHitNormal.z,
-				   trace.m_bStartInSolid ? 1 : 0, trace.m_pEnt ? 1 : 0);
+				   trace.m_bStartInSolid ? 1 : 0, trace.m_pEnt ? "entity" : "world");
 }
 
 namespace
@@ -971,6 +971,8 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 	int firstBlockTick = -1;
 	f32 firstBlockDist = 0.0f;
 	bool firstBlockAir = false;
+	bool firstBlockEntity = false;
+	f32 margin = 32.0f;
 	for (size_t i = 0; i < rows.size(); i++)
 	{
 		Vector w;
@@ -990,6 +992,26 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 				firstBlockPos = tr.m_vEndPos;
 				firstBlockN = tr.m_vHitNormal;
 				firstBlockAir = rows[i].onGround == 0;
+				firstBlockEntity = tr.m_pEnt != nullptr;
+			}
+			// lateral clearance to walls (left and right, capped at 32 u)
+			Vector lw = w, rw = w;
+			lw.x += -sy * 32.0f;
+			lw.y += cy * 32.0f;
+			rw.x -= -sy * 32.0f;
+			rw.y -= cy * 32.0f;
+			trace_t tl, trr;
+			INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, lw, &filter, &tl);
+			INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, rw, &filter, &trr);
+			f32 lm = tl.m_flFraction * 32.0f;
+			f32 rm = trr.m_flFraction * 32.0f;
+			if (lm < margin)
+			{
+				margin = lm;
+			}
+			if (rm < margin)
+			{
+				margin = rm;
 			}
 		}
 		if (rows[i].onGround == 1 && (takeoff < 0 || (int)i <= takeoff))
@@ -1069,17 +1091,19 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 				j << ",\"first_block\":{\"tick\":" << firstBlockTick << ",\"dist_along_path\":" << firstBlockDist
 				  << ",\"pos\":[" << firstBlockPos.x << "," << firstBlockPos.y << "," << firstBlockPos.z << "]"
 				  << ",\"normal\":[" << firstBlockN.x << "," << firstBlockN.y << "," << firstBlockN.z << "]"
+				  << ",\"type\":\"" << (firstBlockEntity ? "entity" : "world") << "\""
 				  << ",\"in_air\":" << (firstBlockAir ? "true" : "false") << "}";
 			}
 			j << ",\"ground\":{\"run_flatness_max_dz\":" << flatMax << ",\"landing_dz\":" << landingDz
 			  << ",\"landing_z\":" << landingZ << ",\"landing_spread\":" << landingSpread
 			  << ",\"landing_clear\":" << (landingClear ? "true" : "false") << "}";
 			j << ",\"ceiling_min_clearance\":" << ceilingMin;
+			j << ",\"margin\":" << margin;
 			j << "}\n";
 		}
 	}
-	META_CONPRINTF("[KZPre] ok=%d rows=%zu takeoff=%d landing=%d block_tick=%d seg=%.1f flat=%.3f landing_dz=%.3f landing_clear=%d ceil=%.1f\n", ok ? 1 : 0, rows.size(),
-				   takeoff, landing, firstBlockTick, firstBlockDist, flatMax, landingDz, landingClear ? 1 : 0, ceilingMin);
+	META_CONPRINTF("[KZPre] ok=%d rows=%zu takeoff=%d landing=%d block_tick=%d seg=%.1f flat=%.3f landing_dz=%.3f landing_clear=%d ceil=%.1f margin=%.1f\n", ok ? 1 : 0,
+				   rows.size(), takeoff, landing, firstBlockTick, firstBlockDist, flatMax, landingDz, landingClear ? 1 : 0, ceilingMin, margin);
 }
 
 CON_COMMAND_F(kz_script_delay, "Set scripted playback start delay in ticks: kz_script_delay <ticks> (default 64)", FCVAR_NONE)
