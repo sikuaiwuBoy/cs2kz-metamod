@@ -4,6 +4,9 @@
 #include "kz_mode.h"
 #include "sdk/datatypes.h"
 
+#include <fstream>
+#include <string>
+
 #define MODE_NAME_SHORT "CKZ"
 #define MODE_NAME       "Classic"
 // Rampbug fix related
@@ -151,6 +154,25 @@ class KZClassicModeService : public KZModeService
 	bool oldJumpPressed {};
 	bool forcedUnduck {};
 	f32 postProcessMovementZSpeed {};
+
+	// R34 E1: read-only internal state log (console command kz_ckz_statelog, default 0).
+	// Fields are only written when the switch is on; when it is off nothing but one integer
+	// comparison happens per movement processing.
+	Vector slVelIn {}, slOrgIn {};
+	Vector slWishdir {};
+	f32 slViewYaw {};
+	f32 slFm {}, slSm {};
+	f32 slCurrentPreRatio {}, slAverageRate {};
+	u32 slButtons {};
+	u32 slTick {};
+	u32 slPhase {};
+	bool slHasBegin {};
+	bool slStreamOpen {};
+	std::ofstream slStream;
+	void SLBegin();
+	void SLEnd();
+	void SLLogEvent(const char *kind, const Vector &origin, const Vector &velocity, f32 diffZ);
+	void SLEnsureOpen();
 
 	struct AngleHistory
 	{

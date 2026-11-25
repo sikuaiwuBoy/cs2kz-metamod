@@ -8,6 +8,8 @@
 #include "sdk/navphysicsinterface.h"
 #include "sdk/entity/cbasetrigger.h"
 
+#include <iomanip>
+
 KZClassicModePlugin g_KZClassicModePlugin;
 
 CGameConfig *g_pGameConfig = NULL;
@@ -18,6 +20,25 @@ ModeServiceFactory g_ModeFactory = [](KZPlayer *player) -> KZModeService * { ret
 PLUGIN_EXPOSE(KZClassicModePlugin, g_KZClassicModePlugin);
 
 CConVarRef<f32> sv_standable_normal("sv_standable_normal");
+
+// R34 E1: read-only state log switch. 0 = off (default), 1 = write ckzstate_<slot>.csv.
+static_global int g_CKZStateLog = 0;
+
+CON_COMMAND_F(kz_ckz_statelog, "R34: CKZ internal state log (0/1). Usage: kz_ckz_statelog [0|1]", FCVAR_NONE)
+{
+	if (args.ArgC() < 2)
+	{
+		META_CONPRINTF("[CKZState] statelog=%d\n", g_CKZStateLog);
+		return;
+	}
+	g_CKZStateLog = atoi(args.Arg(1)) ? 1 : 0;
+	META_CONPRINTF("[CKZState] statelog=%d\n", g_CKZStateLog);
+}
+
+static const char *KZSTATELOG_HEADER = "server_tick,subtick_idx,kind,leftPreRatio,rightPreRatio,currentPreRatio,averageRate,"
+									   "prestrafeGain,maxSpeed,velModifier,vel_in_x,vel_in_y,vel_in_z,vel_out_x,vel_out_y,vel_out_z,"
+									   "origin_in_x,origin_in_y,origin_in_z,origin_out_x,origin_out_y,origin_out_z,view_yaw,"
+									   "oldDuckPressed,forcedUnduck,hasValidView,serverAngleChange,wishdir_x,wishdir_y,fm,sm,buttons,diffZ,note\n";
 
 // The player that is currently running TryPlayerMove or CategorizePosition.
 static_global KZClassicModeService *tracingModeService {};
@@ -199,11 +220,122 @@ const CVValue_t *KZClassicModeService::GetModeConVarValues()
 	return modeCvarValues;
 }
 
+void KZClassicModeService::SLEnsureOpen()
+{
+	if (this->slStreamOpen)
+	{
+		return;
+	}
+	if (!g_SMAPI)
+	{
+		return;
+	}
+	char path[512];
+	int slot = this->player ? this->player->GetPlayerSlot().Get() : 0;
+	g_SMAPI->PathFormat(path, sizeof(path), "%s/addons/cs2kz/logs/ckzstate_%d.csv", g_SMAPI->GetBaseDir(), slot);
+	this->slStream.open(path, std::ios::out | std::ios::trunc);
+	if (this->slStream.is_open())
+	{
+		this->slStream << KZSTATELOG_HEADER;
+		this->slStream.flush();
+		this->slStreamOpen = true;
+	}
+}
+
+void KZClassicModeService::SLBegin()
+{
+	if (!g_CKZStateLog)
+	{
+		if (this->slStreamOpen)
+		{
+			this->slStream.close();
+			this->slStreamOpen = false;
+		}
+		return;
+	}
+	this->SLEnsureOpen();
+	if (!this->slStreamOpen)
+	{
+		return;
+	}
+	u32 tick = g_pKZUtils ? g_pKZUtils->GetServerGlobals()->tickcount : 0;
+	if (tick != this->slTick)
+	{
+		this->slTick = tick;
+		this->slPhase = 0;
+	}
+	else
+	{
+		this->slPhase++;
+	}
+	Vector velocity, origin;
+	this->player->GetVelocity(&velocity);
+	this->player->GetOrigin(&origin);
+	this->slVelIn = velocity;
+	this->slOrgIn = origin;
+	this->slWishdir = vec3_origin;
+	this->slCurrentPreRatio = -1.0f;
+	this->slAverageRate = 0.0f;
+	this->slHasBegin = true;
+}
+
+void KZClassicModeService::SLEnd()
+{
+	if (!g_CKZStateLog || !this->slHasBegin || !this->slStreamOpen)
+	{
+		this->slHasBegin = false;
+		return;
+	}
+	this->slHasBegin = false;
+	Vector velocity, origin;
+	this->player->GetVelocity(&velocity);
+	this->player->GetOrigin(&origin);
+	CCSPlayerPawn *pawn = this->player->GetPlayerPawn();
+	f32 velMod = pawn ? pawn->m_flVelocityModifier() : 1.0f;
+	f32 maxSpeed = this->player->currentMoveData ? this->player->currentMoveData->m_flMaxSpeed : 0.0f;
+	std::ofstream &f = this->slStream;
+	f << this->slTick << "," << this->slPhase << ",move," << std::fixed << std::setprecision(6) << this->leftPreRatio << ","
+	  << this->rightPreRatio << "," << this->slCurrentPreRatio << "," << this->slAverageRate << "," << this->GetPrestrafeGain() << "," << maxSpeed
+	  << "," << velMod << "," << this->slVelIn.x << "," << this->slVelIn.y << "," << this->slVelIn.z << "," << velocity.x << "," << velocity.y << ","
+	  << velocity.z << "," << this->slOrgIn.x << "," << this->slOrgIn.y << "," << this->slOrgIn.z << "," << origin.x << "," << origin.y << ","
+	  << origin.z << "," << this->slViewYaw << "," << (this->oldDuckPressed ? 1 : 0) << "," << (this->forcedUnduck ? 1 : 0) << ","
+	  << (this->hasValidDesiredViewAngle ? 1 : 0) << "," << (this->serverAngleChange ? 1 : 0) << "," << this->slWishdir.x << ","
+	  << this->slWishdir.y << "," << this->slFm << "," << this->slSm << "," << this->slButtons << ",0,\n";
+	f.flush();
+}
+
+void KZClassicModeService::SLLogEvent(const char *kind, const Vector &origin, const Vector &velocity, f32 diffZ)
+{
+	if (!g_CKZStateLog)
+	{
+		return;
+	}
+	this->SLEnsureOpen();
+	if (!this->slStreamOpen)
+	{
+		return;
+	}
+	u32 tick = g_pKZUtils ? g_pKZUtils->GetServerGlobals()->tickcount : 0;
+	std::ofstream &f = this->slStream;
+	f << tick << ",0," << kind << "," << std::fixed << std::setprecision(6) << this->leftPreRatio << "," << this->rightPreRatio << ",-1,0,"
+	  << this->GetPrestrafeGain() << ",0,0," << velocity.x << "," << velocity.y << "," << velocity.z << ",0,0,0," << origin.x << "," << origin.y << ","
+	  << origin.z << ",0,0,0,0," << (this->oldDuckPressed ? 1 : 0) << "," << (this->forcedUnduck ? 1 : 0) << ","
+	  << (this->hasValidDesiredViewAngle ? 1 : 0) << "," << (this->serverAngleChange ? 1 : 0) << ",0,0,0,0,0," << diffZ << ",\n";
+	f.flush();
+}
+
 void KZClassicModeService::OnStopTouchGround()
 {
 	if (this->player->GetMoveType() != MOVETYPE_WALK)
 	{
 		return;
+	}
+	if (g_CKZStateLog)
+	{
+		Vector o, v;
+		this->player->GetOrigin(&o);
+		this->player->GetVelocity(&v);
+		this->SLLogEvent("stop_touch_ground", o, v, 0.0f);
 	}
 	Vector velocity;
 	this->player->GetVelocity(&velocity);
@@ -240,6 +372,14 @@ void KZClassicModeService::OnStopTouchGround()
 
 void KZClassicModeService::OnStartTouchGround()
 {
+	if (g_CKZStateLog)
+	{
+		Vector v;
+		this->player->GetVelocity(&v);
+		Vector lo = this->player->landingOrigin;
+		f32 diffZ = lo.z - this->player->takeoffOrigin.z;
+		this->SLLogEvent("start_touch_ground", lo, v, diffZ);
+	}
 	this->SlopeFix();
 	bbox_t bounds;
 	// Shrink the bounds here as well, otherwise we touch triggers that are flush with the ground.
@@ -424,6 +564,7 @@ void KZClassicModeService::OnSetupMove(CUserCmd *pc)
 
 void KZClassicModeService::OnProcessMovement()
 {
+	this->SLBegin();
 	if (this->player->GetPlayerPawn()->m_flVelocityModifier() != 1.0f)
 	{
 		this->player->GetPlayerPawn()->m_flVelocityModifier(1.0f);
@@ -440,6 +581,14 @@ void KZClassicModeService::OnPlayerMove()
 {
 	this->originalMaxSpeed = this->player->currentMoveData->m_flMaxSpeed;
 	this->player->currentMoveData->m_flMaxSpeed = SPEED_NORMAL + this->GetPrestrafeGain();
+	if (g_CKZStateLog)
+	{
+		this->slViewYaw = this->player->currentMoveData->m_vecViewAngles.y;
+		this->slFm = this->player->currentMoveData->m_flForwardMove;
+		this->slSm = this->player->currentMoveData->m_flSideMove;
+		CCSPlayer_MovementServices *ms = this->player->GetMoveServices();
+		this->slButtons = ms ? ms->m_nButtons().m_pButtonStates[0] : 0;
+	}
 }
 
 void KZClassicModeService::OnProcessMovementPost()
@@ -456,6 +605,7 @@ void KZClassicModeService::OnProcessMovementPost()
 	{
 		this->player->GetPlayerPawn()->m_flVelocityModifier(velMod);
 	}
+	this->SLEnd();
 }
 
 void KZClassicModeService::InterpolateViewAngles()
@@ -582,6 +732,10 @@ void KZClassicModeService::UpdateAngleHistory()
 	wishdir[2] = 0;
 
 	wishdir = g_pKZUtils->NormalizeVector(wishdir);
+	if (g_CKZStateLog)
+	{
+		this->slWishdir = wishdir;
+	}
 
 	if (wishdir.Length() == 0)
 	{
@@ -619,6 +773,10 @@ void KZClassicModeService::CalcPrestrafe()
 	{
 		averageRate = sumWeightedAngles / totalDuration;
 	}
+	if (g_CKZStateLog)
+	{
+		this->slAverageRate = averageRate;
+	}
 
 	f32 rewardRate = Clamp(fabs(averageRate) / PS_MAX_REWARD_RATE, 0.0f, 1.0f) * g_pKZUtils->GetGlobals()->frametime;
 	f32 punishRate = 0.0f;
@@ -645,6 +803,10 @@ void KZClassicModeService::CalcPrestrafe()
 		else
 		{
 			currentPreRatio = pow(this->bonusSpeed / PS_SPEED_MAX * SPEED_NORMAL / speed, 1 / PS_RATIO_TO_SPEED) * PS_MAX_PS_TIME;
+		}
+		if (g_CKZStateLog)
+		{
+			this->slCurrentPreRatio = currentPreRatio;
 		}
 
 		this->leftPreRatio = MIN(this->leftPreRatio, currentPreRatio);
