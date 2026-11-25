@@ -865,6 +865,148 @@ namespace
 		INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), Vector(x, y, z), Vector(x, y, z + 300.0f), &filter, &tr);
 		return tr.m_flFraction * 300.0f;
 	}
+
+	// R35 A2: a single evaluation routine shared by kz_preflight_scan (and kept
+	// line-for-line identical to the kz_preflight body below).  The R34/R35 bug
+	// "scan finds 0 poses at a pose that preflight accepts" came from two
+	// divergent copies of this logic; the scan now calls this one.
+	struct PreflightEval
+	{
+		bool ok = false;
+		int takeoff = -1;
+		int landing = -1;
+		f32 flatMax = 0.0f;
+		f32 margin = 32.0f;
+		f32 dist = 0.0f;
+		f32 ceilingMin = 300.0f;
+		f32 landingZ = 0.0f, landingDz = 0.0f, landingSpread = 0.0f;
+		f32 landingClearance = 300.0f;
+		bool landingClear = false;
+		int firstBlockTick = -1;
+	};
+
+	PreflightEval EvaluatePath(const std::vector<PathRow> &rows,
+	                           CTraceFilterPlayerMovementCS &filter, const Vector &base, f32 yawDeg)
+	{
+		PreflightEval out;
+		const f32 yawRad = yawDeg * (f32)M_PI / 180.0f;
+		const f32 cy = cosf(yawRad), sy = sinf(yawRad);
+		auto worldOf = [&](const PathRow &r, Vector &o) {
+			o.x = base.x + r.u * cy - r.v * sy;
+			o.y = base.y + r.u * sy + r.v * cy;
+			o.z = base.z + r.z;
+		};
+		for (size_t i = 1; i < rows.size(); i++)
+		{
+			if (rows[i].onGround == 0 && rows[i - 1].onGround == 1)
+			{
+				out.takeoff = (int)i - 1;
+				break;
+			}
+		}
+		if (out.takeoff >= 0)
+		{
+			for (size_t i = out.takeoff + 1; i < rows.size(); i++)
+			{
+				if (rows[i].onGround == 1)
+				{
+					out.landing = (int)i;
+					break;
+				}
+			}
+		}
+		f32 takeoffZ = base.z;
+		if (out.takeoff >= 0)
+		{
+			Vector w;
+			worldOf(rows[out.takeoff], w);
+			takeoffZ = ProbeGround(filter, w.x, w.y, w.z);
+		}
+		Vector prevW;
+		worldOf(rows[0], prevW);
+		for (size_t i = 0; i < rows.size(); i++)
+		{
+			Vector w;
+			worldOf(rows[i], w);
+			if (i > 0)
+			{
+				out.dist += sqrtf((w.x - prevW.x) * (w.x - prevW.x) + (w.y - prevW.y) * (w.y - prevW.y));
+				bbox_t b;
+				b.mins = {-16.0f, -16.0f, 0.0f};
+				b.maxs = {16.0f, 16.0f, rows[i].duck ? 54.0f : 72.0f};
+				trace_t tr;
+				INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), prevW, w, &filter, &tr);
+				if (tr.m_flFraction < 1.0f && out.firstBlockTick < 0)
+				{
+					out.firstBlockTick = (int)i;
+				}
+				Vector lw = w, rw = w;
+				lw.x += -sy * 32.0f;
+				lw.y += cy * 32.0f;
+				rw.x -= -sy * 32.0f;
+				rw.y -= cy * 32.0f;
+				trace_t tl, trr;
+				INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, lw, &filter, &tl);
+				INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, rw, &filter, &trr);
+				f32 lm = tl.m_flFraction * 32.0f;
+				f32 rm = trr.m_flFraction * 32.0f;
+				if (lm < out.margin)
+				{
+					out.margin = lm;
+				}
+				if (rm < out.margin)
+				{
+					out.margin = rm;
+				}
+			}
+			if (rows[i].onGround == 1 && (out.takeoff < 0 || (int)i <= out.takeoff))
+			{
+				f32 g = ProbeGround(filter, w.x, w.y, w.z);
+				f32 d = fabsf(g - takeoffZ);
+				if (d > out.flatMax)
+				{
+					out.flatMax = d;
+				}
+			}
+			if (rows[i].onGround == 0)
+			{
+				f32 c = ProbeCeiling(filter, w.x, w.y, w.z, rows[i].duck != 0);
+				if (c < out.ceilingMin)
+				{
+					out.ceilingMin = c;
+				}
+			}
+			prevW = w;
+		}
+		if (out.landing >= 0)
+		{
+			Vector w;
+			worldOf(rows[out.landing], w);
+			out.landingZ = ProbeGround(filter, w.x, w.y, w.z);
+			out.landingDz = out.landingZ - takeoffZ;
+			f32 zs[5];
+			zs[0] = out.landingZ;
+			const f32 off = 16.0f;
+			zs[1] = ProbeGround(filter, w.x + off, w.y, w.z);
+			zs[2] = ProbeGround(filter, w.x - off, w.y, w.z);
+			zs[3] = ProbeGround(filter, w.x, w.y + off, w.z);
+			zs[4] = ProbeGround(filter, w.x, w.y - off, w.z);
+			f32 lo = zs[0], hi = zs[0];
+			for (int k = 1; k < 5; k++)
+			{
+				if (zs[k] < lo) { lo = zs[k]; }
+				if (zs[k] > hi) { hi = zs[k]; }
+			}
+			out.landingSpread = hi - lo;
+			out.landingClear = out.landingSpread <= 0.05f;
+			Vector top = w;
+			top.z = out.landingZ + 1.0f;
+			out.landingClearance = ProbeCeiling(filter, top.x, top.y, top.z, rows[out.landing].duck != 0) + 1.0f;
+		}
+		out.ok = out.firstBlockTick < 0 && out.flatMax <= 0.05f && out.landingClear
+		         && out.landingClearance >= 55.0f;
+		return out;
+	}
 }
 
 // Preflight a plan path from a start pose.
@@ -1193,124 +1335,13 @@ namespace
 	                     const Vector &base, f32 yawDeg)
 	{
 		ScanHit hit;
-		const f32 yawRad = yawDeg * (f32)M_PI / 180.0f;
-		const f32 cy = cosf(yawRad), sy = sinf(yawRad);
-		auto worldOf = [&](const PathRow &r, Vector &out) {
-			out.x = base.x + r.u * cy - r.v * sy;
-			out.y = base.y + r.u * sy + r.v * cy;
-			out.z = base.z + r.z;
-		};
-		int takeoff = -1;
-		for (size_t i = 1; i < rows.size(); i++)
-		{
-			if (rows[i].onGround == 0 && rows[i - 1].onGround == 1)
-			{
-				takeoff = (int)i - 1;
-				break;
-			}
-		}
-		int landing = -1;
-		if (takeoff >= 0)
-		{
-			for (size_t i = takeoff + 1; i < rows.size(); i++)
-			{
-				if (rows[i].onGround == 1)
-				{
-					landing = (int)i;
-					break;
-				}
-			}
-		}
-		f32 takeoffZ = base.z;
-		if (takeoff >= 0)
-		{
-			Vector w;
-			worldOf(rows[takeoff], w);
-			takeoffZ = ProbeGround(filter, w.x, w.y, w.z);
-		}
-		f32 flatMax = 0.0f;
-		f32 dist = 0.0f;
-		Vector prevW;
-		worldOf(rows[0], prevW);
-		int firstBlockTick = -1;
-		for (size_t i = 0; i < rows.size(); i++)
-		{
-			Vector w;
-			worldOf(rows[i], w);
-			if (i > 0)
-			{
-				dist += sqrtf((w.x - prevW.x) * (w.x - prevW.x) + (w.y - prevW.y) * (w.y - prevW.y));
-				bbox_t b;
-				b.mins = {-16.0f, -16.0f, 0.0f};
-				b.maxs = {16.0f, 16.0f, rows[i].duck ? 54.0f : 72.0f};
-				trace_t tr;
-				INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), prevW, w, &filter, &tr);
-				if (tr.m_flFraction < 1.0f && firstBlockTick < 0)
-				{
-					firstBlockTick = (int)i;
-					if (firstBlockTick >= 0)
-					{
-						break;   // every other output is irrelevant for a blocked pose
-					}
-				}
-				Vector lw = w, rw = w;
-				lw.x += -sy * 32.0f;
-				lw.y += cy * 32.0f;
-				rw.x -= -sy * 32.0f;
-				rw.y -= cy * 32.0f;
-				trace_t tl, trr;
-				INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, lw, &filter, &tl);
-				INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, rw, &filter, &trr);
-				f32 lm = tl.m_flFraction * 32.0f;
-				f32 rm = trr.m_flFraction * 32.0f;
-				if (lm < hit.margin)
-				{
-					hit.margin = lm;
-				}
-				if (rm < hit.margin)
-				{
-					hit.margin = rm;
-				}
-			}
-			if (rows[i].onGround == 1 && (takeoff < 0 || (int)i <= takeoff))
-			{
-				f32 g = ProbeGround(filter, w.x, w.y, w.z);
-				f32 d = fabsf(g - takeoffZ);
-				if (d > flatMax)
-				{
-					flatMax = d;
-				}
-			}
-			prevW = w;
-		}
-		f32 landingDz = 0.0f, landingSpread = 0.0f;
-		bool landingClear = false;
-		if (landing >= 0)
-		{
-			Vector w;
-			worldOf(rows[landing], w);
-			f32 lz = ProbeGround(filter, w.x, w.y, w.z);
-			landingDz = lz - takeoffZ;
-			f32 zs[5];
-			zs[0] = lz;
-			const f32 off = 16.0f;
-			zs[1] = ProbeGround(filter, w.x + off, w.y, w.z);
-			zs[2] = ProbeGround(filter, w.x - off, w.y, w.z);
-			zs[3] = ProbeGround(filter, w.x, w.y + off, w.z);
-			zs[4] = ProbeGround(filter, w.x, w.y - off, w.z);
-			f32 lo = zs[0], hi = zs[0];
-			for (int k = 1; k < 5; k++)
-			{
-				if (zs[k] < lo) { lo = zs[k]; }
-				if (zs[k] > hi) { hi = zs[k]; }
-			}
-			landingSpread = hi - lo;
-			landingClear = landingSpread <= 0.05f;
-		}
-		hit.blockTick = firstBlockTick;
-		hit.pathLen = dist;
-		hit.landingDz = landingDz;
-		hit.ok = firstBlockTick < 0 && flatMax <= 0.05f && landingClear;
+		// R35 A2: one shared evaluation (see EvaluatePath) so scan == preflight
+		PreflightEval ev = EvaluatePath(rows, filter, base, yawDeg);
+		hit.ok = ev.ok;
+		hit.margin = ev.margin;
+		hit.blockTick = ev.firstBlockTick;
+		hit.pathLen = ev.dist;
+		hit.landingDz = ev.landingDz;
 		return hit;
 	}
 }
