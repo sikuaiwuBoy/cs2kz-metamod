@@ -938,8 +938,11 @@ namespace
 			sb.mins = {-16.0f, -16.0f, 0.0f};
 			sb.maxs = {16.0f, 16.0f, rows[0].duck ? 54.0f : 72.0f};
 			trace_t st;
-			INavPhysicsInterface::TraceShape(Ray_t(sb.mins, sb.maxs), w0,
-			                                 Vector(w0.x, w0.y, w0.z + 0.5f), &filter, &st);
+			// hull bottom exactly on the floor reads as start-in-solid (see the landing
+			// clearance probe), so test one unit above the feet
+			INavPhysicsInterface::TraceShape(Ray_t(sb.mins, sb.maxs),
+			                                 Vector(w0.x, w0.y, w0.z + 1.0f),
+			                                 Vector(w0.x, w0.y, w0.z + 1.5f), &filter, &st);
 			out.startSolid = st.m_bStartInSolid;
 		}
 		for (size_t i = 1; i < rows.size(); i++)
