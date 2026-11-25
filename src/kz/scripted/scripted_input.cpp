@@ -1377,7 +1377,7 @@ CON_COMMAND_F(kz_preflight_scan, "Scan start poses around the current position: 
 			// the start must have ground below and headroom (cheap early-out)
 			f32 g = ProbeGround(filter, base.x, base.y, base.z + 2.0f);
 			if (base.z - g > 8.0f) { continue; }
-			base.z = g;
+			base.z = g + 0.03125f;   // hull bottom exactly on the floor reads as start-in-solid
 			f32 ceil = ProbeCeiling(filter, base.x, base.y, base.z + 1.0f, false);
 			if (ceil < 55.0f) { continue; }
 			for (int ih = 0; ih < nHead; ih++)
