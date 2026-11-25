@@ -1171,3 +1171,247 @@ CON_COMMAND_F(kz_script_mode, "Set scripted input injection mode: fields | butto
 	}
 	META_CONPRINTF("[KZScript] mode=%s\n", ModeName(g_scriptMode));
 }
+
+// R35 A3: batch preflight scan around the current position.
+// usage: kz_preflight_scan <path_csv> [radius] [step] [slot] [heading_step]
+// Scans a square grid (+-radius, step) x headings (0..359, heading_step) and writes
+// logs/preflight_scan_<slot>.json with every feasible pose (ok + margin), sorted by
+// margin; a coarse per-cell heading count is included for the text heatmap.
+namespace
+{
+	struct ScanHit
+	{
+		bool ok = false;
+		f32 margin = 32.0f;
+		int blockTick = -1;
+		f32 pathLen = 0.0f;
+		f32 landingDz = 0.0f;
+	};
+
+	// same checks as kz_preflight, no logging
+	ScanHit EvalPathPose(const std::vector<PathRow> &rows, CTraceFilterPlayerMovementCS &filter,
+	                     const Vector &base, f32 yawDeg)
+	{
+		ScanHit hit;
+		const f32 yawRad = yawDeg * (f32)M_PI / 180.0f;
+		const f32 cy = cosf(yawRad), sy = sinf(yawRad);
+		auto worldOf = [&](const PathRow &r, Vector &out) {
+			out.x = base.x + r.u * cy - r.v * sy;
+			out.y = base.y + r.u * sy + r.v * cy;
+			out.z = base.z + r.z;
+		};
+		int takeoff = -1;
+		for (size_t i = 1; i < rows.size(); i++)
+		{
+			if (rows[i].onGround == 0 && rows[i - 1].onGround == 1)
+			{
+				takeoff = (int)i - 1;
+				break;
+			}
+		}
+		int landing = -1;
+		if (takeoff >= 0)
+		{
+			for (size_t i = takeoff + 1; i < rows.size(); i++)
+			{
+				if (rows[i].onGround == 1)
+				{
+					landing = (int)i;
+					break;
+				}
+			}
+		}
+		f32 takeoffZ = base.z;
+		if (takeoff >= 0)
+		{
+			Vector w;
+			worldOf(rows[takeoff], w);
+			takeoffZ = ProbeGround(filter, w.x, w.y, w.z);
+		}
+		f32 flatMax = 0.0f;
+		f32 dist = 0.0f;
+		Vector prevW;
+		worldOf(rows[0], prevW);
+		int firstBlockTick = -1;
+		for (size_t i = 0; i < rows.size(); i++)
+		{
+			Vector w;
+			worldOf(rows[i], w);
+			if (i > 0)
+			{
+				dist += sqrtf((w.x - prevW.x) * (w.x - prevW.x) + (w.y - prevW.y) * (w.y - prevW.y));
+				bbox_t b;
+				b.mins = {-16.0f, -16.0f, 0.0f};
+				b.maxs = {16.0f, 16.0f, rows[i].duck ? 54.0f : 72.0f};
+				trace_t tr;
+				INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), prevW, w, &filter, &tr);
+				if (tr.m_flFraction < 1.0f && firstBlockTick < 0)
+				{
+					firstBlockTick = (int)i;
+				}
+				Vector lw = w, rw = w;
+				lw.x += -sy * 32.0f;
+				lw.y += cy * 32.0f;
+				rw.x -= -sy * 32.0f;
+				rw.y -= cy * 32.0f;
+				trace_t tl, trr;
+				INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, lw, &filter, &tl);
+				INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, rw, &filter, &trr);
+				f32 lm = tl.m_flFraction * 32.0f;
+				f32 rm = trr.m_flFraction * 32.0f;
+				if (lm < hit.margin)
+				{
+					hit.margin = lm;
+				}
+				if (rm < hit.margin)
+				{
+					hit.margin = rm;
+				}
+			}
+			if (rows[i].onGround == 1 && (takeoff < 0 || (int)i <= takeoff))
+			{
+				f32 g = ProbeGround(filter, w.x, w.y, w.z);
+				f32 d = fabsf(g - takeoffZ);
+				if (d > flatMax)
+				{
+					flatMax = d;
+				}
+			}
+			prevW = w;
+		}
+		f32 landingDz = 0.0f, landingSpread = 0.0f;
+		bool landingClear = false;
+		if (landing >= 0)
+		{
+			Vector w;
+			worldOf(rows[landing], w);
+			f32 lz = ProbeGround(filter, w.x, w.y, w.z);
+			landingDz = lz - takeoffZ;
+			f32 zs[5];
+			zs[0] = lz;
+			const f32 off = 16.0f;
+			zs[1] = ProbeGround(filter, w.x + off, w.y, w.z);
+			zs[2] = ProbeGround(filter, w.x - off, w.y, w.z);
+			zs[3] = ProbeGround(filter, w.x, w.y + off, w.z);
+			zs[4] = ProbeGround(filter, w.x, w.y - off, w.z);
+			f32 lo = zs[0], hi = zs[0];
+			for (int k = 1; k < 5; k++)
+			{
+				if (zs[k] < lo) { lo = zs[k]; }
+				if (zs[k] > hi) { hi = zs[k]; }
+			}
+			landingSpread = hi - lo;
+			landingClear = landingSpread <= 0.05f;
+		}
+		hit.blockTick = firstBlockTick;
+		hit.pathLen = dist;
+		hit.landingDz = landingDz;
+		hit.ok = firstBlockTick < 0 && flatMax <= 0.05f && landingClear;
+		return hit;
+	}
+}
+
+CON_COMMAND_F(kz_preflight_scan, "Scan start poses around the current position: kz_preflight_scan <path_csv> [radius] [step] [slot] [heading_step]", FCVAR_NONE)
+{
+	if (args.ArgC() < 2)
+	{
+		META_CONPRINTF("[KZScan] usage: kz_preflight_scan <path_csv> [radius] [step] [slot] [heading_step]\n");
+		return;
+	}
+	const char *pathFile = args.Arg(1);
+	f32 radius = args.ArgC() >= 3 ? (f32)atof(args.Arg(2)) : 300.0f;
+	f32 step = args.ArgC() >= 4 ? (f32)atof(args.Arg(3)) : 32.0f;
+	int slot = args.ArgC() >= 5 ? atoi(args.Arg(4)) : 0;
+	f32 hstep = args.ArgC() >= 6 ? (f32)atof(args.Arg(5)) : 45.0f;
+	if (step < 8.0f) { step = 8.0f; }
+	if (hstep < 5.0f) { hstep = 5.0f; }
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(CPlayerSlot(slot));
+	CCSPlayerPawn *pawn = player ? player->GetPlayerPawn() : nullptr;
+	if (!pawn)
+	{
+		META_CONPRINTF("[KZScan] no pawn in slot %d\n", slot);
+		return;
+	}
+	std::vector<PathRow> rows;
+	{
+		std::ifstream f(pathFile);
+		if (!f.is_open())
+		{
+			META_CONPRINTF("[KZScan] cannot open %s\n", pathFile);
+			return;
+		}
+		std::string line;
+		bool first = true;
+		while (std::getline(f, line))
+		{
+			if (line.empty()) { continue; }
+			if (first && line.rfind("tick", 0) == 0) { first = false; continue; }
+			first = false;
+			PathRow r {};
+			int n = sscanf(line.c_str(), "%*d,%f,%f,%f,%d,%d", &r.u, &r.v, &r.z, &r.duck, &r.onGround);
+			if (n >= 5) { rows.push_back(r); }
+		}
+	}
+	if (rows.size() < 3)
+	{
+		META_CONPRINTF("[KZScan] path too short (%zu rows) %s\n", rows.size(), pathFile);
+		return;
+	}
+	Vector center;
+	player->GetOrigin(&center);
+	CTraceFilterPlayerMovementCS filter(pawn);
+	struct Pose { f32 x, y, z, yaw, margin; };
+	std::vector<Pose> good;
+	int nHead = (int)(360.0f / hstep);
+	int nSide = (int)(radius / step);
+	int total = 0, okCount = 0;
+	for (int ix = -nSide; ix <= nSide; ix++)
+	{
+		for (int iy = -nSide; iy <= nSide; iy++)
+		{
+			Vector base(center.x + ix * step, center.y + iy * step, center.z);
+			// the start must have ground below and headroom (cheap early-out)
+			f32 g = ProbeGround(filter, base.x, base.y, base.z + 2.0f);
+			if (base.z - g > 8.0f) { continue; }
+			base.z = g;
+			f32 ceil = ProbeCeiling(filter, base.x, base.y, base.z + 1.0f, false);
+			if (ceil < 55.0f) { continue; }
+			for (int ih = 0; ih < nHead; ih++)
+			{
+				f32 yaw = ih * hstep;
+				total++;
+				ScanHit h = EvalPathPose(rows, filter, base, yaw);
+				if (h.ok)
+				{
+					okCount++;
+					good.push_back({base.x, base.y, base.z, yaw, h.margin});
+				}
+			}
+		}
+	}
+	std::sort(good.begin(), good.end(), [](const Pose &a, const Pose &b) { return a.margin > b.margin; });
+	char outPath[512];
+	g_SMAPI->PathFormat(outPath, sizeof(outPath), "%s/addons/cs2kz/logs/preflight_scan_%d.json", g_SMAPI->GetBaseDir(), slot);
+	{
+		std::ofstream j(outPath, std::ios::out | std::ios::trunc);
+		if (j.is_open())
+		{
+			j.precision(3);
+			j << std::fixed;
+			j << "{\"center\":[" << center.x << "," << center.y << "," << center.z << "]";
+			j << ",\"radius\":" << radius << ",\"step\":" << step << ",\"heading_step\":" << hstep;
+			j << ",\"poses_tested\":" << total << ",\"ok\":" << okCount;
+			j << ",\"paths\":[";
+			size_t lim = good.size() < 2000 ? good.size() : 2000;
+			for (size_t i = 0; i < lim; i++)
+			{
+				if (i) { j << ","; }
+				j << "{\"x\":" << good[i].x << ",\"y\":" << good[i].y << ",\"z\":" << good[i].z
+				  << ",\"yaw\":" << good[i].yaw << ",\"margin\":" << good[i].margin << "}";
+			}
+			j << "]}\n";
+		}
+	}
+	META_CONPRINTF("[KZScan] center=%.1f %.1f %.1f radius=%.0f step=%.0f hstep=%.0f tested=%d ok=%d out=%s\n",
+	               center.x, center.y, center.z, radius, step, hstep, total, okCount, outPath);
+}
