@@ -14,6 +14,8 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <vector>
 
 using scripted::ScriptedInput;
 using scripted::ScriptTick;
@@ -777,6 +779,300 @@ CON_COMMAND_F(kz_probe_z, "Trace a player hull straight down and print the groun
 	INavPhysicsInterface::TraceShape(Ray_t(bounds.mins, bounds.maxs), Vector(x, y, startZ), Vector(x, y, -2000.0f), &filter, &trace);
 	META_CONPRINTF("[KZProbe] x=%.3f y=%.3f z=%.4f start_solid=%d frac=%.4f nz=%.3f\n", x, y, trace.m_vEndPos.z, trace.m_bStartInSolid ? 1 : 0,
 				   trace.m_flFraction, trace.m_vHitNormal.z);
+}
+
+// ============================================================================
+// R33 P2: engine-side preflight (hull sweep along a plan path)
+// ============================================================================
+
+// Sweep a player hull from A to B.
+// usage: kz_trace_hull x1 y1 z1 x2 y2 z2 [stand|duck] [slot]
+CON_COMMAND_F(kz_trace_hull, "Sweep a player hull from A to B: kz_trace_hull x1 y1 z1 x2 y2 z2 [stand|duck] [slot]", FCVAR_NONE)
+{
+	if (args.ArgC() < 7)
+	{
+		META_CONPRINTF("[KZTrace] usage: kz_trace_hull x1 y1 z1 x2 y2 z2 [stand|duck] [slot]\n");
+		return;
+	}
+	Vector a((f32)atof(args.Arg(1)), (f32)atof(args.Arg(2)), (f32)atof(args.Arg(3)));
+	Vector b((f32)atof(args.Arg(4)), (f32)atof(args.Arg(5)), (f32)atof(args.Arg(6)));
+	bool duck = args.ArgC() >= 8 && strcmp(args.Arg(7), "duck") == 0;
+	int slot = args.ArgC() >= 9 ? atoi(args.Arg(8)) : 0;
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(CPlayerSlot(slot));
+	CCSPlayerPawn *pawn = player ? player->GetPlayerPawn() : nullptr;
+	if (!pawn)
+	{
+		META_CONPRINTF("[KZTrace] no pawn in slot %d\n", slot);
+		return;
+	}
+	CTraceFilterPlayerMovementCS filter(pawn);
+	bbox_t bounds;
+	bounds.mins = {-16.0f, -16.0f, 0.0f};
+	bounds.maxs = {16.0f, 16.0f, duck ? 54.0f : 72.0f};
+	trace_t trace;
+	INavPhysicsInterface::TraceShape(Ray_t(bounds.mins, bounds.maxs), a, b, &filter, &trace);
+	META_CONPRINTF("[KZTrace] frac=%.5f end=%.3f %.3f %.3f normal=%.3f %.3f %.3f start_solid=%d ent=%d\n",
+				   trace.m_flFraction, trace.m_vEndPos.x, trace.m_vEndPos.y, trace.m_vEndPos.z,
+				   trace.m_vHitNormal.x, trace.m_vHitNormal.y, trace.m_vHitNormal.z,
+				   trace.m_bStartInSolid ? 1 : 0, trace.m_pEnt ? 1 : 0);
+}
+
+namespace
+{
+	struct PathRow
+	{
+		f32 u, v, z;
+		int duck;
+		int onGround;
+	};
+
+	// point trace straight down from (x, y, z+2); returns the hit z (or z-200 when nothing)
+	f32 ProbeGround(CTraceFilterPlayerMovementCS &filter, f32 x, f32 y, f32 z)
+	{
+		bbox_t b;
+		b.mins = {0.0f, 0.0f, 0.0f};
+		b.maxs = {0.0f, 0.0f, 0.0f};
+		trace_t tr;
+		INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), Vector(x, y, z + 2.0f), Vector(x, y, z - 200.0f), &filter, &tr);
+		return tr.m_flFraction >= 1.0f ? z - 200.0f : tr.m_vEndPos.z;
+	}
+
+	// free space above the feet (hull sweep up), capped at 300
+	f32 ProbeCeiling(CTraceFilterPlayerMovementCS &filter, f32 x, f32 y, f32 z, bool duck)
+	{
+		bbox_t b;
+		b.mins = {0.0f, 0.0f, 0.0f};
+		b.maxs = {0.0f, 0.0f, duck ? 54.0f : 72.0f};
+		trace_t tr;
+		INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), Vector(x, y, z), Vector(x, y, z + 300.0f), &filter, &tr);
+		return tr.m_flFraction * 300.0f;
+	}
+}
+
+// Preflight a plan path from a start pose.
+// usage: kz_preflight <path_csv> [x y z yaw] [slot]
+// path_csv columns: tick,u,v,z,duck,on_ground  (u = forward, v = left, z = relative to the
+// takeoff plane; the file may start with a "tick,u,v,z,duck,on_ground" header).
+CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz_preflight <path_csv> [x y z yaw] [slot]", FCVAR_NONE)
+{
+	if (args.ArgC() < 2)
+	{
+		META_CONPRINTF("[KZPre] usage: kz_preflight <path_csv> [x y z yaw] [slot]\n");
+		return;
+	}
+	const char *pathFile = args.Arg(1);
+	int slot = 0;
+	if (args.ArgC() >= 7)
+	{
+		slot = atoi(args.Arg(6));
+	}
+	else if (args.ArgC() >= 3)
+	{
+		slot = atoi(args.Arg(2));
+	}
+	KZPlayer *player = g_pKZPlayerManager->ToPlayer(CPlayerSlot(slot));
+	CCSPlayerPawn *pawn = player ? player->GetPlayerPawn() : nullptr;
+	if (!pawn)
+	{
+		META_CONPRINTF("[KZPre] no pawn in slot %d\n", slot);
+		return;
+	}
+	Vector base;
+	QAngle eye;
+	if (args.ArgC() >= 6)
+	{
+		base = Vector((f32)atof(args.Arg(2)), (f32)atof(args.Arg(3)), (f32)atof(args.Arg(4)));
+		eye.y = (f32)atof(args.Arg(5));
+	}
+	else
+	{
+		player->GetOrigin(&base);
+		eye = pawn->m_angEyeAngles();
+	}
+	std::vector<PathRow> rows;
+	{
+		std::ifstream f(pathFile);
+		if (!f.is_open())
+		{
+			META_CONPRINTF("[KZPre] cannot open %s\n", pathFile);
+			return;
+		}
+		std::string line;
+		bool first = true;
+		while (std::getline(f, line))
+		{
+			if (line.empty())
+			{
+				continue;
+			}
+			if (first && line.rfind("tick", 0) == 0)
+			{
+				first = false;
+				continue;
+			}
+			first = false;
+			PathRow r {};
+			int n = sscanf(line.c_str(), "%*d,%f,%f,%f,%d,%d", &r.u, &r.v, &r.z, &r.duck, &r.onGround);
+			if (n >= 5)
+			{
+				rows.push_back(r);
+			}
+		}
+	}
+	if (rows.size() < 3)
+	{
+		META_CONPRINTF("[KZPre] path too short (%zu rows) %s\n", rows.size(), pathFile);
+		return;
+	}
+	const f32 yawRad = eye.y * (f32)M_PI / 180.0f;
+	const f32 cy = cosf(yawRad), sy = sinf(yawRad);
+	auto worldOf = [&](const PathRow &r, Vector &out) {
+		out.x = base.x + r.u * cy - r.v * sy;
+		out.y = base.y + r.u * sy + r.v * cy;
+		out.z = base.z + r.z;
+	};
+	CTraceFilterPlayerMovementCS filter(pawn);
+	// takeoff row = last on-ground row before the first air row
+	int takeoff = -1;
+	for (size_t i = 1; i < rows.size(); i++)
+	{
+		if (rows[i].onGround == 0 && rows[i - 1].onGround == 1)
+		{
+			takeoff = (int)i - 1;
+			break;
+		}
+	}
+	int landing = -1;
+	if (takeoff >= 0)
+	{
+		for (size_t i = takeoff + 1; i < rows.size(); i++)
+		{
+			if (rows[i].onGround == 1)
+			{
+				landing = (int)i;
+				break;
+			}
+		}
+	}
+	// ground flatness over the runup (on-ground rows up to takeoff)
+	f32 takeoffZ = base.z;
+	if (takeoff >= 0)
+	{
+		Vector w;
+		worldOf(rows[takeoff], w);
+		takeoffZ = ProbeGround(filter, w.x, w.y, w.z);
+	}
+	f32 flatMax = 0.0f;
+	f32 ceilingMin = 300.0f;
+	f32 dist = 0.0f;
+	Vector prevW;
+	worldOf(rows[0], prevW);
+	Vector firstBlockPos {}, firstBlockN {};
+	int firstBlockTick = -1;
+	f32 firstBlockDist = 0.0f;
+	bool firstBlockAir = false;
+	for (size_t i = 0; i < rows.size(); i++)
+	{
+		Vector w;
+		worldOf(rows[i], w);
+		if (i > 0)
+		{
+			dist += sqrtf((w.x - prevW.x) * (w.x - prevW.x) + (w.y - prevW.y) * (w.y - prevW.y));
+			bbox_t b;
+			b.mins = {-16.0f, -16.0f, 0.0f};
+			b.maxs = {16.0f, 16.0f, rows[i].duck ? 54.0f : 72.0f};
+			trace_t tr;
+			INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), prevW, w, &filter, &tr);
+			if (tr.m_flFraction < 1.0f && firstBlockTick < 0)
+			{
+				firstBlockTick = (int)i;
+				firstBlockDist = dist;
+				firstBlockPos = tr.m_vEndPos;
+				firstBlockN = tr.m_vHitNormal;
+				firstBlockAir = rows[i].onGround == 0;
+			}
+		}
+		if (rows[i].onGround == 1 && (takeoff < 0 || (int)i <= takeoff))
+		{
+			f32 g = ProbeGround(filter, w.x, w.y, w.z);
+			f32 d = fabsf(g - takeoffZ);
+			if (d > flatMax)
+			{
+				flatMax = d;
+			}
+		}
+		if (rows[i].onGround == 0)
+		{
+			f32 c = ProbeCeiling(filter, w.x, w.y, w.z, rows[i].duck != 0);
+			if (c < ceilingMin)
+			{
+				ceilingMin = c;
+			}
+		}
+		prevW = w;
+	}
+	// landing platform
+	f32 landingZ = 0.0f, landingDz = 0.0f, landingSpread = 0.0f, landingClearance = 300.0f;
+	bool landingClear = false;
+	int landingTick = -1;
+	if (landing >= 0)
+	{
+		Vector w;
+		worldOf(rows[landing], w);
+		landingTick = landing;
+		landingZ = ProbeGround(filter, w.x, w.y, w.z);
+		landingDz = landingZ - takeoffZ;
+		f32 zs[5];
+		zs[0] = landingZ;
+		const f32 off = 16.0f;
+		zs[1] = ProbeGround(filter, w.x + off, w.y, w.z);
+		zs[2] = ProbeGround(filter, w.x - off, w.y, w.z);
+		zs[3] = ProbeGround(filter, w.x, w.y + off, w.z);
+		zs[4] = ProbeGround(filter, w.x, w.y - off, w.z);
+		f32 lo = zs[0], hi = zs[0];
+		for (int k = 1; k < 5; k++)
+		{
+			lo = std::min(lo, zs[k]);
+			hi = std::max(hi, zs[k]);
+		}
+		landingSpread = hi - lo;
+		landingClear = landingSpread <= 0.05f;
+		Vector top = w;
+		top.z = landingZ;
+		landingClearance = ProbeCeiling(filter, top.x, top.y, top.z, rows[landing].duck != 0);
+	}
+	bool ok = firstBlockTick < 0 && flatMax <= 0.05f && landingClear && landingClearance >= 55.0f;
+	// JSON out
+	char outPath[512];
+	g_SMAPI->PathFormat(outPath, sizeof(outPath), "%s/addons/cs2kz/logs/preflight_%d.json", g_SMAPI->GetBaseDir(), slot);
+	{
+		std::ofstream j(outPath, std::ios::out | std::ios::trunc);
+		if (j.is_open())
+		{
+			j.precision(4);
+			j << std::fixed;
+			j << "{\"ok\":" << (ok ? "true" : "false");
+			j << ",\"rows\":" << rows.size();
+			j << ",\"takeoff_tick\":" << takeoff;
+			j << ",\"landing_tick\":" << landingTick;
+			j << ",\"start\":[" << base.x << "," << base.y << "," << base.z << "," << eye.y << "]";
+			j << ",\"path_len\":" << dist;
+			if (firstBlockTick >= 0)
+			{
+				j << ",\"first_block\":{\"tick\":" << firstBlockTick << ",\"dist_along_path\":" << firstBlockDist
+				  << ",\"pos\":[" << firstBlockPos.x << "," << firstBlockPos.y << "," << firstBlockPos.z << "]"
+				  << ",\"normal\":[" << firstBlockN.x << "," << firstBlockN.y << "," << firstBlockN.z << "]"
+				  << ",\"in_air\":" << (firstBlockAir ? "true" : "false") << "}";
+			}
+			j << ",\"ground\":{\"run_flatness_max_dz\":" << flatMax << ",\"landing_dz\":" << landingDz
+			  << ",\"landing_z\":" << landingZ << ",\"landing_spread\":" << landingSpread
+			  << ",\"landing_clear\":" << (landingClear ? "true" : "false") << "}";
+			j << ",\"ceiling_min_clearance\":" << ceilingMin;
+			j << "}\n";
+		}
+	}
+	META_CONPRINTF("[KZPre] ok=%d rows=%zu takeoff=%d landing=%d block_tick=%d seg=%.1f flat=%.3f landing_dz=%.3f landing_clear=%d ceil=%.1f\n", ok ? 1 : 0, rows.size(),
+				   takeoff, landing, firstBlockTick, firstBlockDist, flatMax, landingDz, landingClear ? 1 : 0, ceilingMin);
 }
 
 CON_COMMAND_F(kz_script_delay, "Set scripted playback start delay in ticks: kz_script_delay <ticks> (default 64)", FCVAR_NONE)
