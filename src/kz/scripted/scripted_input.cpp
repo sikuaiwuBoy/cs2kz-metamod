@@ -814,7 +814,8 @@ CON_COMMAND_F(kz_trace_hull, "Sweep a player hull from A to B: kz_trace_hull x1 
 	META_CONPRINTF("[KZTrace] frac=%.5f end=%.3f %.3f %.3f normal=%.3f %.3f %.3f start_solid=%d type=%s\n",
 				   trace.m_flFraction, trace.m_vEndPos.x, trace.m_vEndPos.y, trace.m_vEndPos.z,
 				   trace.m_vHitNormal.x, trace.m_vHitNormal.y, trace.m_vHitNormal.z,
-				   trace.m_bStartInSolid ? 1 : 0, trace.m_pEnt ? "entity" : "world");
+				   trace.m_bStartInSolid ? 1 : 0,
+				   (trace.m_pEnt && trace.m_pEnt->entindex() != 0) ? "entity" : "world");
 }
 
 namespace
@@ -992,7 +993,7 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 				firstBlockPos = tr.m_vEndPos;
 				firstBlockN = tr.m_vHitNormal;
 				firstBlockAir = rows[i].onGround == 0;
-				firstBlockEntity = tr.m_pEnt != nullptr;
+				firstBlockEntity = tr.m_pEnt != nullptr && tr.m_pEnt->entindex() != 0;
 			}
 			// lateral clearance to walls (left and right, capped at 32 u)
 			Vector lw = w, rw = w;
@@ -1067,8 +1068,8 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 		landingSpread = hi - lo;
 		landingClear = landingSpread <= 0.05f;
 		Vector top = w;
-		top.z = landingZ;
-		landingClearance = ProbeCeiling(filter, top.x, top.y, top.z, rows[landing].duck != 0);
+		top.z = landingZ + 1.0f;   // hull bottom exactly on the floor reads as start-in-solid
+		landingClearance = ProbeCeiling(filter, top.x, top.y, top.z, rows[landing].duck != 0) + 1.0f;
 	}
 	bool ok = firstBlockTick < 0 && flatMax <= 0.05f && landingClear && landingClearance >= 55.0f;
 	// JSON out
@@ -1096,7 +1097,8 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 			}
 			j << ",\"ground\":{\"run_flatness_max_dz\":" << flatMax << ",\"landing_dz\":" << landingDz
 			  << ",\"landing_z\":" << landingZ << ",\"landing_spread\":" << landingSpread
-			  << ",\"landing_clear\":" << (landingClear ? "true" : "false") << "}";
+			  << ",\"landing_clear\":" << (landingClear ? "true" : "false")
+			  << ",\"landing_clearance\":" << landingClearance << "}";
 			j << ",\"ceiling_min_clearance\":" << ceilingMin;
 			j << ",\"margin\":" << margin;
 			j << "}\n";
