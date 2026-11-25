@@ -855,6 +855,22 @@ namespace
 		return tr.m_flFraction >= 1.0f ? z - 200.0f : tr.m_vEndPos.z;
 	}
 
+	// R36 P2: like ProbeGround but reports whether anything was hit at all
+	bool ProbeGroundZ(CTraceFilterPlayerMovementCS &filter, f32 x, f32 y, f32 z, f32 &outZ)
+	{
+		bbox_t b;
+		b.mins = {0.0f, 0.0f, 0.0f};
+		b.maxs = {0.0f, 0.0f, 0.0f};
+		trace_t tr;
+		INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), Vector(x, y, z + 2.0f), Vector(x, y, z - 200.0f), &filter, &tr);
+		if (tr.m_flFraction >= 1.0f)
+		{
+			return false;
+		}
+		outZ = tr.m_vEndPos.z;
+		return true;
+	}
+
 	// free space above the feet (hull sweep up), capped at 300
 	f32 ProbeCeiling(CTraceFilterPlayerMovementCS &filter, f32 x, f32 y, f32 z, bool duck)
 	{
@@ -883,6 +899,17 @@ namespace
 		f32 landingClearance = 300.0f;
 		bool landingClear = false;
 		int firstBlockTick = -1;
+		// R36 P2: the start pose itself must stand on ground and must not intersect geometry
+		bool startGroundOk = false;
+		bool startSolid = false;
+		bool groundMissing = false;
+		f32 startGroundDz = 999.0f;
+		// first blocking hit details (was only computed in kz_preflight before)
+		Vector firstBlockPos {}, firstBlockN {};
+		f32 firstBlockDist = 0.0f;
+		bool firstBlockAir = false;
+		bool firstBlockEntity = false;
+		std::string firstBlockClass;
 	};
 
 	PreflightEval EvaluatePath(const std::vector<PathRow> &rows,
@@ -896,6 +923,25 @@ namespace
 			o.y = base.y + r.u * sy + r.v * cy;
 			o.z = base.z + r.z;
 		};
+		// R36 P2: start-pose checks.  Before this, "no ground hit" and "ground hit"
+		// both produced the same flatMax reference, so a pose in mid-air passed.
+		{
+			Vector w0;
+			worldOf(rows[0], w0);
+			f32 gz = 0.0f;
+			if (ProbeGroundZ(filter, w0.x, w0.y, w0.z, gz))
+			{
+				out.startGroundDz = gz - w0.z;
+				out.startGroundOk = fabsf(out.startGroundDz) <= 2.0f;
+			}
+			bbox_t sb;
+			sb.mins = {-16.0f, -16.0f, 0.0f};
+			sb.maxs = {16.0f, 16.0f, rows[0].duck ? 54.0f : 72.0f};
+			trace_t st;
+			INavPhysicsInterface::TraceShape(Ray_t(sb.mins, sb.maxs), w0,
+			                                 Vector(w0.x, w0.y, w0.z + 0.5f), &filter, &st);
+			out.startSolid = st.m_bStartInSolid;
+		}
 		for (size_t i = 1; i < rows.size(); i++)
 		{
 			if (rows[i].onGround == 0 && rows[i - 1].onGround == 1)
@@ -939,6 +985,13 @@ namespace
 				if (tr.m_flFraction < 1.0f && out.firstBlockTick < 0)
 				{
 					out.firstBlockTick = (int)i;
+					out.firstBlockDist = out.dist;
+					out.firstBlockPos = tr.m_vEndPos;
+					out.firstBlockN = tr.m_vHitNormal;
+					out.firstBlockAir = rows[i].onGround == 0;
+					const char *bcls = tr.m_pEnt ? tr.m_pEnt->GetClassname() : nullptr;
+					out.firstBlockClass = bcls ? bcls : "";
+					out.firstBlockEntity = !IsWorldClass(bcls);
 				}
 				Vector lw = w, rw = w;
 				lw.x += -sy * 32.0f;
@@ -961,11 +1014,18 @@ namespace
 			}
 			if (rows[i].onGround == 1 && (out.takeoff < 0 || (int)i <= out.takeoff))
 			{
-				f32 g = ProbeGround(filter, w.x, w.y, w.z);
-				f32 d = fabsf(g - takeoffZ);
-				if (d > out.flatMax)
+				f32 g = 0.0f;
+				if (ProbeGroundZ(filter, w.x, w.y, w.z, g))
 				{
-					out.flatMax = d;
+					f32 d = fabsf(g - takeoffZ);
+					if (d > out.flatMax)
+					{
+						out.flatMax = d;
+					}
+				}
+				else
+				{
+					out.groundMissing = true;
 				}
 			}
 			if (rows[i].onGround == 0)
@@ -982,15 +1042,15 @@ namespace
 		{
 			Vector w;
 			worldOf(rows[out.landing], w);
-			out.landingZ = ProbeGround(filter, w.x, w.y, w.z);
+			bool allHit = ProbeGroundZ(filter, w.x, w.y, w.z, out.landingZ);
 			out.landingDz = out.landingZ - takeoffZ;
 			f32 zs[5];
 			zs[0] = out.landingZ;
 			const f32 off = 16.0f;
-			zs[1] = ProbeGround(filter, w.x + off, w.y, w.z);
-			zs[2] = ProbeGround(filter, w.x - off, w.y, w.z);
-			zs[3] = ProbeGround(filter, w.x, w.y + off, w.z);
-			zs[4] = ProbeGround(filter, w.x, w.y - off, w.z);
+			allHit = ProbeGroundZ(filter, w.x + off, w.y, w.z, zs[1]) && allHit;
+			allHit = ProbeGroundZ(filter, w.x - off, w.y, w.z, zs[2]) && allHit;
+			allHit = ProbeGroundZ(filter, w.x, w.y + off, w.z, zs[3]) && allHit;
+			allHit = ProbeGroundZ(filter, w.x, w.y - off, w.z, zs[4]) && allHit;
 			f32 lo = zs[0], hi = zs[0];
 			for (int k = 1; k < 5; k++)
 			{
@@ -998,13 +1058,16 @@ namespace
 				if (zs[k] > hi) { hi = zs[k]; }
 			}
 			out.landingSpread = hi - lo;
-			out.landingClear = out.landingSpread <= 0.05f;
+			out.landingClear = allHit && out.landingSpread <= 0.05f;
 			Vector top = w;
 			top.z = out.landingZ + 1.0f;
 			out.landingClearance = ProbeCeiling(filter, top.x, top.y, top.z, rows[out.landing].duck != 0) + 1.0f;
 		}
+		// R36 P2: a landing more than 48 u below the takeoff plane means the plan leaves
+		// the platform (the E7 pose landed 128 u low and CKZ wrote no jump row at all).
 		out.ok = out.firstBlockTick < 0 && out.flatMax <= 0.05f && out.landingClear
-		         && out.landingClearance >= 55.0f;
+		         && out.landingClearance >= 55.0f && out.startGroundOk && !out.startSolid
+		         && !out.groundMissing && fabsf(out.landingDz) <= 48.0f;
 		return out;
 	}
 }
@@ -1084,156 +1147,27 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 		META_CONPRINTF("[KZPre] path too short (%zu rows) %s\n", rows.size(), pathFile);
 		return;
 	}
-	const f32 yawRad = eye.y * (f32)M_PI / 180.0f;
-	const f32 cy = cosf(yawRad), sy = sinf(yawRad);
-	auto worldOf = [&](const PathRow &r, Vector &out) {
-		out.x = base.x + r.u * cy - r.v * sy;
-		out.y = base.y + r.u * sy + r.v * cy;
-		out.z = base.z + r.z;
-	};
 	CTraceFilterPlayerMovementCS filter(pawn);
-	// takeoff row = last on-ground row before the first air row
-	int takeoff = -1;
-	for (size_t i = 1; i < rows.size(); i++)
-	{
-		if (rows[i].onGround == 0 && rows[i - 1].onGround == 1)
-		{
-			takeoff = (int)i - 1;
-			break;
-		}
-	}
-	int landing = -1;
-	if (takeoff >= 0)
-	{
-		for (size_t i = takeoff + 1; i < rows.size(); i++)
-		{
-			if (rows[i].onGround == 1)
-			{
-				landing = (int)i;
-				break;
-			}
-		}
-	}
-	// ground flatness over the runup (on-ground rows up to takeoff)
-	f32 takeoffZ = base.z;
-	if (takeoff >= 0)
-	{
-		Vector w;
-		worldOf(rows[takeoff], w);
-		takeoffZ = ProbeGround(filter, w.x, w.y, w.z);
-	}
-	f32 flatMax = 0.0f;
-	f32 ceilingMin = 300.0f;
-	f32 dist = 0.0f;
-	Vector prevW;
-	worldOf(rows[0], prevW);
-	Vector firstBlockPos {}, firstBlockN {};
-	int firstBlockTick = -1;
-	f32 firstBlockDist = 0.0f;
-	bool firstBlockAir = false;
-	bool firstBlockEntity = false;
-	std::string firstBlockClass;
-	f32 margin = 32.0f;
-	for (size_t i = 0; i < rows.size(); i++)
-	{
-		Vector w;
-		worldOf(rows[i], w);
-		if (i > 0)
-		{
-			dist += sqrtf((w.x - prevW.x) * (w.x - prevW.x) + (w.y - prevW.y) * (w.y - prevW.y));
-			bbox_t b;
-			b.mins = {-16.0f, -16.0f, 0.0f};
-			b.maxs = {16.0f, 16.0f, rows[i].duck ? 54.0f : 72.0f};
-			trace_t tr;
-			INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), prevW, w, &filter, &tr);
-			if (tr.m_flFraction < 1.0f && firstBlockTick < 0)
-			{
-				firstBlockTick = (int)i;
-				firstBlockDist = dist;
-				firstBlockPos = tr.m_vEndPos;
-				firstBlockN = tr.m_vHitNormal;
-				firstBlockAir = rows[i].onGround == 0;
-				const char *bcls = tr.m_pEnt ? tr.m_pEnt->GetClassname() : nullptr;
-				firstBlockClass = bcls ? bcls : "";
-				firstBlockEntity = !IsWorldClass(bcls);
-			}
-			// lateral clearance to walls (left and right, capped at 32 u)
-			Vector lw = w, rw = w;
-			lw.x += -sy * 32.0f;
-			lw.y += cy * 32.0f;
-			rw.x -= -sy * 32.0f;
-			rw.y -= cy * 32.0f;
-			trace_t tl, trr;
-			INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, lw, &filter, &tl);
-			INavPhysicsInterface::TraceShape(Ray_t(b.mins, b.maxs), w, rw, &filter, &trr);
-			f32 lm = tl.m_flFraction * 32.0f;
-			f32 rm = trr.m_flFraction * 32.0f;
-			if (lm < margin)
-			{
-				margin = lm;
-			}
-			if (rm < margin)
-			{
-				margin = rm;
-			}
-		}
-		if (rows[i].onGround == 1 && (takeoff < 0 || (int)i <= takeoff))
-		{
-			f32 g = ProbeGround(filter, w.x, w.y, w.z);
-			f32 d = fabsf(g - takeoffZ);
-			if (d > flatMax)
-			{
-				flatMax = d;
-			}
-		}
-		if (rows[i].onGround == 0)
-		{
-			f32 c = ProbeCeiling(filter, w.x, w.y, w.z, rows[i].duck != 0);
-			if (c < ceilingMin)
-			{
-				ceilingMin = c;
-			}
-		}
-		prevW = w;
-	}
-	// landing platform
-	f32 landingZ = 0.0f, landingDz = 0.0f, landingSpread = 0.0f, landingClearance = 300.0f;
-	bool landingClear = false;
-	int landingTick = -1;
-	if (landing >= 0)
-	{
-		Vector w;
-		worldOf(rows[landing], w);
-		landingTick = landing;
-		landingZ = ProbeGround(filter, w.x, w.y, w.z);
-		landingDz = landingZ - takeoffZ;
-		f32 zs[5];
-		zs[0] = landingZ;
-		const f32 off = 16.0f;
-		zs[1] = ProbeGround(filter, w.x + off, w.y, w.z);
-		zs[2] = ProbeGround(filter, w.x - off, w.y, w.z);
-		zs[3] = ProbeGround(filter, w.x, w.y + off, w.z);
-		zs[4] = ProbeGround(filter, w.x, w.y - off, w.z);
-		f32 lo = zs[0], hi = zs[0];
-		for (int k = 1; k < 5; k++)
-		{
-			// MSVC: windows.h min/max macros would break std::min/std::max here
-			if (zs[k] < lo)
-			{
-				lo = zs[k];
-			}
-			if (zs[k] > hi)
-			{
-				hi = zs[k];
-			}
-		}
-		landingSpread = hi - lo;
-		landingClear = landingSpread <= 0.05f;
-		Vector top = w;
-		top.z = landingZ + 1.0f;   // hull bottom exactly on the floor reads as start-in-solid
-		landingClearance = ProbeCeiling(filter, top.x, top.y, top.z, rows[landing].duck != 0) + 1.0f;
-	}
-	bool ok = firstBlockTick < 0 && flatMax <= 0.05f && landingClear && landingClearance >= 55.0f;
+	PreflightEval ev = EvaluatePath(rows, filter, base, eye.y);
+	const int takeoff = ev.takeoff;
+	const int landingTick = ev.landing;
+	const f32 flatMax = ev.flatMax;
+	const f32 margin = ev.margin;
+	const f32 dist = ev.dist;
+	const f32 ceilingMin = ev.ceilingMin;
+	const f32 landingDz = ev.landingDz;
+	const f32 landingZ = ev.landingZ;
+	const f32 landingSpread = ev.landingSpread;
+	const bool landingClear = ev.landingClear;
+	const f32 landingClearance = ev.landingClearance;
+	const int firstBlockTick = ev.firstBlockTick;
+	const f32 firstBlockDist = ev.firstBlockDist;
+	const Vector firstBlockPos = ev.firstBlockPos;
+	const Vector firstBlockN = ev.firstBlockN;
+	const bool firstBlockAir = ev.firstBlockAir;
+	const bool firstBlockEntity = ev.firstBlockEntity;
+	const std::string firstBlockClass = ev.firstBlockClass;
+	const bool ok = ev.ok;
 	// JSON out
 	char outPath[512];
 	g_SMAPI->PathFormat(outPath, sizeof(outPath), "%s/addons/cs2kz/logs/preflight_%d.json", g_SMAPI->GetBaseDir(), slot);
@@ -1248,6 +1182,10 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 			j << ",\"takeoff_tick\":" << takeoff;
 			j << ",\"landing_tick\":" << landingTick;
 			j << ",\"start\":[" << base.x << "," << base.y << "," << base.z << "," << eye.y << "]";
+			j << ",\"start_pose\":{\"ground_ok\":" << (ev.startGroundOk ? "true" : "false")
+			  << ",\"ground_dz\":" << ev.startGroundDz
+			  << ",\"solid\":" << (ev.startSolid ? "true" : "false")
+			  << ",\"ground_missing\":" << (ev.groundMissing ? "true" : "false") << "}";
 			j << ",\"path_len\":" << dist;
 			if (firstBlockTick >= 0)
 			{
@@ -1267,8 +1205,9 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 			j << "}\n";
 		}
 	}
-	META_CONPRINTF("[KZPre] ok=%d rows=%zu takeoff=%d landing=%d block_tick=%d seg=%.1f flat=%.3f landing_dz=%.3f landing_clear=%d ceil=%.1f margin=%.1f\n", ok ? 1 : 0,
-				   rows.size(), takeoff, landing, firstBlockTick, firstBlockDist, flatMax, landingDz, landingClear ? 1 : 0, ceilingMin, margin);
+	META_CONPRINTF("[KZPre] ok=%d rows=%zu takeoff=%d landing=%d block_tick=%d seg=%.1f flat=%.3f landing_dz=%.3f landing_clear=%d ceil=%.1f margin=%.1f start_ok=%d start_solid=%d start_dz=%.2f\n", ok ? 1 : 0,
+				   rows.size(), takeoff, landingTick, firstBlockTick, firstBlockDist, flatMax, landingDz, landingClear ? 1 : 0, ceilingMin, margin,
+				   ev.startGroundOk ? 1 : 0, ev.startSolid ? 1 : 0, ev.startGroundDz);
 }
 
 CON_COMMAND_F(kz_script_delay, "Set scripted playback start delay in ticks: kz_script_delay <ticks> (default 64)", FCVAR_NONE)
