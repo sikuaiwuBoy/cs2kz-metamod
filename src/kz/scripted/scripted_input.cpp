@@ -1032,8 +1032,15 @@ CON_COMMAND_F(kz_preflight, "Preflight a plan path with the engine collision: kz
 		f32 lo = zs[0], hi = zs[0];
 		for (int k = 1; k < 5; k++)
 		{
-			lo = std::min(lo, zs[k]);
-			hi = std::max(hi, zs[k]);
+			// MSVC: windows.h min/max macros would break std::min/std::max here
+			if (zs[k] < lo)
+			{
+				lo = zs[k];
+			}
+			if (zs[k] > hi)
+			{
+				hi = zs[k];
+			}
 		}
 		landingSpread = hi - lo;
 		landingClear = landingSpread <= 0.05f;
