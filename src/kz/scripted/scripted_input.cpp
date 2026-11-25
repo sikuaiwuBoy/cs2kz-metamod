@@ -1248,6 +1248,10 @@ namespace
 				if (tr.m_flFraction < 1.0f && firstBlockTick < 0)
 				{
 					firstBlockTick = (int)i;
+					if (firstBlockTick >= 0)
+					{
+						break;   // every other output is irrelevant for a blocked pose
+					}
 				}
 				Vector lw = w, rw = w;
 				lw.x += -sy * 32.0f;
